@@ -18,6 +18,7 @@ root = 'gs://aou_wlu'
 data_path = f'{root}/data'
 test_path = f'{root}/test'
 GTF_PATH = 'gs://hail-common/references/gencode/gencode.v29.annotation.gtf.bgz'
+ANCESTRY_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv'
 N_GENE_PER_GROUP = 10
 
 def summarize_genes_per_chrom(gtf):
@@ -116,7 +117,7 @@ def impute_missing_gp(mt, location: str = 'GP', mean_impute: bool = True):
         gp_expr = [1.0, 0.0, 0.0]
     return mt.annotate_entries(**{location: hl.or_else(mt._gp, gp_expr)}).drop('_gp')
 
-def export_vds_to_bgen(vds_path, interval, output_dir, mean_impute_missing, no_adj, callrate_filter):
+def export_vds_to_bgen(vds_path, pop_ht, interval, output_dir, mean_impute_missing, no_adj, callrate_filter):
     def read_vds(vds_path):
         vds = hl.vds.read_vds(vds_path)
         return vds
@@ -126,6 +127,7 @@ def export_vds_to_bgen(vds_path, interval, output_dir, mean_impute_missing, no_a
 
     # Filter to interval
     sub_vds = hl.vds.filter_intervals(vds, hl.literal([interval]))
+    sub_vds = hl.vds.filter_samples(sub_vds, pop_ht, keep=True, remove_dead_alleles=True)
 
     # Densify subset VDS
     mt = hl.vds.to_dense_mt(sub_vds)
@@ -182,12 +184,18 @@ def main(args):
         if args.update_gene_intervals:
             group_ht = create_gene_group_interval()
             group_ht.write(f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht")
+
         int_ht = hl.read_table(args.input_interval_path)
         intervals = int_ht.aggregate(hl.agg.collect(int_ht.interval))
-        output_dir = test_path if args.test else f"{root}/bgen/{args.data_type}"
+
+        pop_ht = hl.read_table(ANCESTRY_PATH)
+        pop_ht = pop_ht.filter(pop_ht.ancestry_pred == args.pop)
+
+        output_dir = test_path if args.test else f"{root}/bgen/{args.data_type}/{args.pop}"
+
         for interval in intervals:
             j = b.new_python_job(name=f"export_{interval}")
-            j.call(export_vds_to_bgen, args.input_vds_path, interval, output_dir, args.mean_impute_missing, args.no_adj, args.callrate_filter)
+            j.call(export_vds_to_bgen, args.input_vds_path, pop_ht, interval, output_dir, args.mean_impute_missing, args.no_adj, args.callrate_filter)
             if args.test:
                 break
         b.run()
@@ -238,6 +246,7 @@ if __name__ == "__main__":
         help="Update grouped gene intervals",
         action="store_true"
     )
+    parser.add_argument('--pop', help='Comma-separated list of pops to run', choices=['afr', 'amr', 'eas', 'eur', 'mid', 'sas'])
     parser.add_argument('--no_adj', help='Use all genotypes instead of only high-quality ones', action='store_true')
     parser.add_argument('--callrate_filter', help='Impose filter of specified callrate (default: none)', default=0.0, type=float)
     args = parser.parse_args()
