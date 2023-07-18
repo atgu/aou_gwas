@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 
-__author__ = 'konradk, wlu'
+__author__ = 'wlu'
 
 import argparse
 import logging
 from gnomad.utils.vep import *
 from gnomad.utils.filtering import *
-from ukbb_common import *
 from ukbb_pan_ancestry import *
+from utils.resources import *
 
 logger = logging.getLogger("ALL_x_AoU_preprocessing_SAIGE_data")
 
 BUCKET = 'gs://aou-analysis/'
-TRANCHE = '?'
+TRANCHE = '250k'
 GWAS_AF_CUTOFF = 0.001
 RVAS_AF_CUTOFF = 0.01
 CALLRATE_CUTOFF = 0.8
@@ -29,13 +29,6 @@ ANCESTRY_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/
 SAMPLE_QC_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/qc/flagged_samples.tsv'
 RELATEDNESS_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/relatedness/relatedness.tsv'
 GENE_INTERVAL_PATH = f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
-
-def do_annotate(mt, meta_ht, by_col=True):
-    if by_col:
-        mt = mt.annotate_cols(**meta_ht[mt.col_key])
-    else:
-        mt = mt.annotate_rows(**meta_ht[mt.row_key])
-    return mt
 
 def get_aou_vep_path(tranche: str = TRANCHE):
     return f'{CURRENT_BUCKET}/util/aou_vep_{tranche}.ht'
@@ -89,9 +82,8 @@ def main(args):
 
     # Load variant info table and re-format
     vat_ht = hl.import_table(VAT_TSV_PATH, force=True, quote='"', delimiter="\t", force_bgz=True, types = get_vat_field_types())
-    vat_ht = vat_ht.annotate(locus=hl.locus(vat_ht.contig, vat_ht.position, reference_genome='GRCh38'),
-                             alleles=[vat_ht.ref_allele, vat_ht.alt_allele])
-    vat_ht = vat_ht.key_by('locus', 'alleles')
+    vat_ht = vat_ht.key_by(locus=hl.locus(vat_ht.contig, vat_ht.position, reference_genome='GRCh38'),
+                           alleles=[vat_ht.ref_allele, vat_ht.alt_allele])
     vat_ht = vat_ht.checkpoint(get_aou_vat_path(), _read_if_exists=not args.overwrite, overwrite=args.overwrite)
     vat_ht = vat_ht.filter(vat_ht.gvs_all_ac > 0)
     pop_ht = hl.import_table(ANCESTRY_PATH, key="research_id", impute=True,
@@ -145,15 +137,14 @@ def main(args):
             sub_vds = hl.vds.filter_chromosomes(sub_vds, keep_autosomes=True)
             sub_vds = hl.vds.filter_variants(sub_vds, call_stats_ht, keep=True)
 
-            if pop == 'eur':
-                print('Removing HLA...')
-                # Common inversion taken from Table S4 of https://www.ncbi.nlm.nih.gov/pubmed/27472961
-                # (converted to GRCh38 by: https://liftover.broadinstitute.org/#input=chr8%3A8055789-11980649&hg=hg19-to-hg38 )
-                # Also removing HLA, from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38
-                sub_vds = hl.vds.filter_intervals(sub_vds,
-                                                  hl.literal([hl.parse_locus_interval('chr8:8198267-12123140', reference_genome='GRCh38'),
-                                                              hl.parse_locus_interval('chr6:28510120-33480577', reference_genome='GRCh38')]),
-                                                  keep=False)
+            print('Removing HLA...')
+            # Common inversion taken from Table S4 of https://www.ncbi.nlm.nih.gov/pubmed/27472961
+            # (converted to GRCh38 by: https://liftover.broadinstitute.org/#input=chr8%3A8055789-11980649&hg=hg19-to-hg38 )
+            # Also removing HLA, from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38
+            sub_vds = hl.vds.filter_intervals(sub_vds,
+                                              hl.literal([hl.parse_locus_interval('chr8:8198267-12123140', reference_genome='GRCh38'),
+                                                          hl.parse_locus_interval('chr6:28510120-33480577', reference_genome='GRCh38')]),
+                                              keep=False)
             mt = hl.vds.to_dense_mt(sub_vds)
             mt = mt.checkpoint(get_aou_grm_mt_path(pop, iteration), _read_if_exists=not args.overwrite, overwrite=args.overwrite)
             mt = mt.unfilter_entries()
@@ -164,52 +155,52 @@ def main(args):
                 ht.write(get_aou_grm_pruned_ht_path(pop, window), overwrite=args.overwrite)
             ht = hl.read_table(get_aou_grm_pruned_ht_path(pop, window))
             mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
-            if pop == 'eur':
-                mt = mt.filter_rows(hl.rand_bool(0.55))
+
+            ## TODO: check numbers of variants per population
+            ## mt = mt.filter_rows(hl.rand_bool(0.55))
 
             if args.overwrite or not hl.hadoop_exists(f'{get_aou_grm_plink_path(pop, iteration, window)}.bed'):
                 print(f'Exporting plink to {get_aou_grm_plink_path(pop, iteration, window)}...')
                 hl.export_plink(mt, get_aou_grm_plink_path(pop, iteration, window))
 
-    if args.genotype_summary:
-        variants = hl.read_table(ukb_imputed_info_ht_path)
-        print(variants.count())
-        variants = variants.filter(variants.info > 0.8)
-        print(variants.count())
-        meta_ht = hl.import_table(get_ukb_meta_pop_tsv_path(), impute=True, types={'s': hl.tstr}, key='s')
-
-        mt = get_ukb_imputed_data('all', variant_list=variants, entry_fields=('dosage', ))
-        mt = mt.annotate_cols(**meta_ht[mt.col_key])
-        ht = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
-                              an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
-        ht = ht.checkpoint(get_ukb_af_ht_path(False), args.overwrite, _read_if_exists=not args.overwrite)
-
-        mt = get_ukb_imputed_data('X', variant_list=variants, entry_fields=('dosage', ))
-        mt = mt.annotate_cols(**meta_ht[mt.col_key])
-        ht_x = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
-                              an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
-        ht = ht.union(ht_x)
-        ht = ht.checkpoint(get_ukb_af_ht_path(), args.overwrite, _read_if_exists=not args.overwrite)
-        ht = ht.naive_coalesce(1000).checkpoint(get_ukb_af_ht_path(repart=True), args.overwrite, _read_if_exists=not args.overwrite)
-
-        print(ht.aggregate(hl.struct(
-            # hist=hl.agg.hist(hl.sum(ht.an.values()), 0, total_samples, 10),  # No missing data
-            # fraction_missingness=hl.agg.fraction(hl.sum(ht.an.values()) < total_samples),
-            # number_sites_above_001=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.001, ht.af.values())),
-            # number_sites_above_005=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.005, ht.af.values())),
-            # number_sites_above_01=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.01, ht.af.values())),
-            # number_sites_above_05=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.05, ht.af.values())),
-            # number_sites_above_10=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.1, ht.af.values()))
-            number_sites_above_mac_20=hl.agg.count_where(hl.any(lambda x: ht.af[x] * ht.an[x] >= 20, hl.literal(POPS))),
-            number_run_sites_above_mac_20=hl.agg.sum(hl.sum(hl.map(lambda x: hl.int(ht.af[x] * ht.an[x] >= 20), hl.literal(POPS))))
-        )))
+    # if args.genotype_summary:
+    #     variants = hl.read_table(ukb_imputed_info_ht_path)
+    #     print(variants.count())
+    #     variants = variants.filter(variants.info > 0.8)
+    #     print(variants.count())
+    #     meta_ht = hl.import_table(get_ukb_meta_pop_tsv_path(), impute=True, types={'s': hl.tstr}, key='s')
+    #
+    #     mt = get_ukb_imputed_data('all', variant_list=variants, entry_fields=('dosage', ))
+    #     mt = mt.annotate_cols(**meta_ht[mt.col_key])
+    #     ht = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
+    #                           an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
+    #     ht = ht.checkpoint(get_ukb_af_ht_path(False), args.overwrite, _read_if_exists=not args.overwrite)
+    #
+    #     mt = get_ukb_imputed_data('X', variant_list=variants, entry_fields=('dosage', ))
+    #     mt = mt.annotate_cols(**meta_ht[mt.col_key])
+    #     ht_x = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
+    #                           an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
+    #     ht = ht.union(ht_x)
+    #     ht = ht.checkpoint(get_ukb_af_ht_path(), args.overwrite, _read_if_exists=not args.overwrite)
+    #     ht = ht.naive_coalesce(1000).checkpoint(get_ukb_af_ht_path(repart=True), args.overwrite, _read_if_exists=not args.overwrite)
+    #
+    #     print(ht.aggregate(hl.struct(
+    #         # hist=hl.agg.hist(hl.sum(ht.an.values()), 0, total_samples, 10),  # No missing data
+    #         # fraction_missingness=hl.agg.fraction(hl.sum(ht.an.values()) < total_samples),
+    #         # number_sites_above_001=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.001, ht.af.values())),
+    #         # number_sites_above_005=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.005, ht.af.values())),
+    #         # number_sites_above_01=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.01, ht.af.values())),
+    #         # number_sites_above_05=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.05, ht.af.values())),
+    #         # number_sites_above_10=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.1, ht.af.values()))
+    #         number_sites_above_mac_20=hl.agg.count_where(hl.any(lambda x: ht.af[x] * ht.an[x] >= 20, hl.literal(POPS))),
+    #         number_run_sites_above_mac_20=hl.agg.sum(hl.sum(hl.map(lambda x: hl.int(ht.af[x] * ht.an[x] >= 20), hl.literal(POPS))))
+    #     )))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-type", nargs="?", help="Type of analysis to conduct", default="gwas", choices=["gwas", "rvas"])
+    parser.add_argument("--data-type", nargs=1, help="Type of analysis to conduct", default="gwas", choices=["gwas", "rvas"])
     parser.add_argument("--test", help="Whether to run test on a subset of the data", action="store_true")
-
     parser.add_argument('--pheno_summary', action='store_true')
     parser.add_argument('--prepare_genotype_data', action='store_true')
     parser.add_argument('--genotype_summary', action='store_true')
@@ -219,7 +210,7 @@ if __name__ == '__main__':
     parser.add_argument('--pops', help='Comma-separated list of pops to run', default=['afr', 'amr', 'eas', 'eur', 'mid', 'sas'])
     parser.add_argument('--create_plink_file', help='Overwrite everything', action='store_true')
     parser.add_argument('--vep', help='Overwrite everything', action='store_true')
-    parser.add_argument('--slack_channel', help='Send message to Slack channel/user', default='@konradjk')
+    parser.add_argument('--slack_channel', help='Send message to Slack channel/user', default='@wlu')
     args = parser.parse_args()
 
     # if args.slack_channel:

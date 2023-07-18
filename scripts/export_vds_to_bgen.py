@@ -189,7 +189,8 @@ def main(args):
         intervals = int_ht.aggregate(hl.agg.collect(int_ht.interval))
 
         pop_ht = hl.read_table(ANCESTRY_PATH)
-        pop_ht = pop_ht.filter(pop_ht.ancestry_pred == args.pop)
+        if args.pop != 'all':
+            pop_ht = pop_ht.filter(pop_ht.ancestry_pred == args.pop)
 
         output_dir = test_path if args.test else f"{root}/bgen/{args.data_type}/{args.pop}"
 
@@ -246,7 +247,7 @@ if __name__ == "__main__":
         help="Update grouped gene intervals",
         action="store_true"
     )
-    parser.add_argument('--pop', help='Comma-separated list of pops to run', choices=['afr', 'amr', 'eas', 'eur', 'mid', 'sas'])
+    parser.add_argument('--pop', help='Comma-separated list of pops to run', choices=['afr', 'amr', 'eas', 'eur', 'mid', 'sas', 'all'])
     parser.add_argument('--no_adj', help='Use all genotypes instead of only high-quality ones', action='store_true')
     parser.add_argument('--callrate_filter', help='Impose filter of specified callrate (default: none)', default=0.0, type=float)
     args = parser.parse_args()
