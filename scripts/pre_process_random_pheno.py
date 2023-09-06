@@ -3,6 +3,11 @@ import argparse
 import hailtop.batch as hb
 
 root = 'gs://aou_wlu'
+# Computed in the AoU workbench by running:
+# ANCESTRY_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv'
+# pop_ht = hl.import_table(ANCESTRY_PATH, key="research_id", impute=True,
+#                              types={"research_id": "tstr", "pca_features": hl.tarray(hl.tfloat)})
+# pop_ht.aggregate(hl.agg.counter(pop_ht.ancestry_pred))
 N_SAMPLES = {'all':245394, 'afr':56913, 'amr':45035, 'eas':5706, 'eur':133581, 'mid':942, 'sas':3217}
 
 def get_aou_sites_for_grm_path(extension: str, pruned: bool=False):
@@ -32,10 +37,9 @@ def filter_ht_for_plink(
         variants_per_mac_category: int = 2000,
         variants_per_maf_category: int = 10000
 ):
-    # from gnomad.utils.filtering import filter_to_autosomes
-    # ht = filter_to_autosomes(ht)
-    ht = ht.filter(ht.locus.in_autosome())
-    ht = ht.filter((ht.info.AN >= N_SAMPLES[pop] * 2 * min_call_rate) &
+
+    ht = ht.filter(ht.locus.in_autosome() &
+                   (ht.info.AN >= N_SAMPLES[pop] * 2 * min_call_rate) &
                    (ht.info.AC[0] > 0))
     ht = ht.annotate(mac_category=mac_category_case_builder(ht.info))
 
@@ -111,38 +115,32 @@ def filter_ht_for_plink(
 #     return ht
 
 def main(args):
-    hl.init(default_reference='GRCh38', log='/pre_process.log')
-    try:
+    hl.init(driver_memory='highmem', driver_cores=8, default_reference='GRCh38', log='/pre_process.log')
 
-        if args.create_plink_file:
-            mt = hl.read_matrix_table(mt_path)  # (34807589, 245394)
-            ht = mt.rows()
-            filtered_ht = filter_ht_for_plink(ht, pop='all')
-            filtered_ht = filtered_ht.naive_coalesce(1000).checkpoint(get_aou_sites_for_grm_path(extension='ht'),
-                                                                      _read_if_exists=not args.overwrite,
-                                                                      overwrite=args.overwrite)
+    if args.create_plink_file:
+        mt = hl.read_matrix_table(mt_path)  # (34807589, 245394)
+        ht = mt.rows()
+        filtered_ht = filter_ht_for_plink(ht, pop='all')
+        filtered_ht = filtered_ht.naive_coalesce(1000).checkpoint(get_aou_sites_for_grm_path(extension='ht'),
+                                                                  _read_if_exists=not args.overwrite,
+                                                                  overwrite=args.overwrite)
 
-            mt = mt.filter_rows(hl.is_defined(filtered_ht[mt.row_key]))
-            mt = mt.naive_coalesce(1000).checkpoint(get_aou_sites_for_grm_path(extension='mt'),
-                                                    _read_if_exists=not args.overwrite,
-                                                    overwrite=args.overwrite)
+        mt = mt.filter_rows(hl.is_defined(filtered_ht[mt.row_key]))
+        mt = mt.naive_coalesce(1000).checkpoint(get_aou_sites_for_grm_path(extension='mt'),
+                                                _read_if_exists=not args.overwrite,
+                                                overwrite=args.overwrite)
 
-            mt = mt.unfilter_entries()
-            ht = hl.ld_prune(mt.GT, r2=0.1)
+        mt = mt.unfilter_entries()
+        ht = hl.ld_prune(mt.GT, r2=0.1)
 
-            ht = ht.checkpoint(get_aou_sites_for_grm_path(extension='ht', pruned=True),
-                               _read_if_exists=not args.overwrite,
-                               overwrite=args.overwrite)
-            mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
+        ht = ht.checkpoint(get_aou_sites_for_grm_path(extension='ht', pruned=True),
+                           _read_if_exists=not args.overwrite,
+                           overwrite=args.overwrite)
+        mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
 
-            if args.overwrite or not hl.hadoop_exists(f'{get_aou_sites_for_grm_path(extension="bed", pruned=True)}'):
-                hl.export_plink(mt, get_aou_sites_for_grm_path(extension="plink", pruned=True))
+        if args.overwrite or not hl.hadoop_exists(f'{get_aou_sites_for_grm_path(extension="bed", pruned=True)}'):
+            hl.export_plink(mt, get_aou_sites_for_grm_path(extension="plink", pruned=True))
 
-
-
-    finally:
-        from datetime import date
-        hl.copy_log(f"{root}/log/bgen_{date.today()}.log")
 
 
 if __name__ == "__main__":
