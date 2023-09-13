@@ -113,13 +113,14 @@ def main(args):
                                                 _read_if_exists=not args.overwrite,
                                                 overwrite=args.overwrite)
 
-        mt = mt.unfilter_entries()
-        ht = hl.ld_prune(mt.GT, r2=0.1) # ask wei what if we donot do this
+        if args.ld_prune: # wei: it should be fine to skip LD pruning here
+            mt = mt.unfilter_entries()
+            ht = hl.ld_prune(mt.GT, r2=0.1)
 
-        ht = ht.checkpoint(get_aou_sites_for_grm_path(extension='ht', pruned=True),
-                           _read_if_exists=not args.overwrite,
-                           overwrite=args.overwrite)
-        mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
+            ht = ht.checkpoint(get_aou_sites_for_grm_path(extension='ht', pruned=True),
+                               _read_if_exists=not args.overwrite,
+                               overwrite=args.overwrite)
+            mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
 
         if args.overwrite or not hl.hadoop_exists(f'{get_aou_sites_for_grm_path(extension="bed", pruned=True)}'):
             hl.export_plink(mt, get_aou_sites_for_grm_path(extension="plink", pruned=True))
@@ -143,7 +144,7 @@ def main(args):
 
         sparse_grm = create_sparse_grm(b,
                                        sparse_grm_root,
-                                       get_aou_sites_for_grm_path(extension="plink", pruned=True),
+                                       get_aou_sites_for_grm_path(extension="plink", pruned=False),
                                        SAIGE_DOCKER_IMAGE,
                                        relatedness_cutoff,
                                        num_markers,
@@ -182,6 +183,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run-hail-ibd",
         help="Run hl.identity_by_descent() to obtain relatedness information",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--ld-prune",
+        help="Whether to run LD pruning on the downsampled variants",
         action="store_true"
     )
     parser.add_argument('--pop', help='Comma-separated list of pops to run',
