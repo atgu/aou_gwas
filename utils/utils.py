@@ -1,6 +1,6 @@
 import hail as hl
 import pandas as pd
-from utils.resources import *
+from .resources import *
 
 GENE_INTERVAL_PATH = (
     f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
@@ -15,7 +15,61 @@ gtf_path = "gs://hail-common/references/gencode/gencode.v29.annotation.gtf.bgz"
 
 def parse_empty_missing(v, f):
     new_v = f(v)
-    return hl.if_else(hl.len(v) == 0, hl.missing(new_v.dtype), new_v)
+    return hl.if_else((hl.len(v) == 0), hl.missing(new_v.dtype), new_v)
+
+
+def get_vat_field_types():
+    # For more info: https://support.researchallofus.org/hc/en-us/articles/4615256690836
+    tags = (
+        "afr",
+        "amr",
+        "asj",
+        "eas",
+        "eur",
+        "fin",
+        "mid",
+        "nfr",
+        "sas",
+        "oth",
+        "max",
+        "all",
+    )
+    fields = ("ac", "an", "sc")
+    types = {}
+    for tag in tags:
+        types[f"gvs_{tag}_af"] = hl.tfloat64
+        types[f"gnomad_{tag}_af"] = hl.tfloat64
+        for field in fields:
+            types[f"gvs_{tag}_{field}"] = hl.tint32
+            types[f"gnomad_{tag}_{field}"] = hl.tint32
+    types["is_canonical_transcript"] = hl.tbool
+    types["omim_phenotypes_id"] = hl.tarray(hl.tint32)
+    for x in [
+        "position",
+        "gene_omim_id",
+        "splice_ai_acceptor_gain_distance",
+        "splice_ai_acceptor_loss_distance",
+        "splice_ai_donor_gain_distance",
+        "splice_ai_donor_loss_distance",
+    ]:
+        types[x] = hl.tint32
+    for x in [
+        "revel",
+        "splice_ai_acceptor_gain_score",
+        "splice_ai_acceptor_loss_score",
+        "splice_ai_donor_gain_score",
+        "splice_ai_donor_loss_score",
+    ]:
+        types[x] = hl.tfloat64
+    for x in [
+        "omim_phenotypes_name",
+        "clinvar_classification",
+        "clinvar_phenotype",
+        "consequence",
+        "dbsnp_rsid",
+    ]:
+        types[x] = hl.tarray(hl.tstr)
+    return types
 
 
 def group_gene_lens(ht, n, overwrite=False):

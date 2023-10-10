@@ -39,10 +39,10 @@ hailctl config list
 - Options: `--batch` run jobs with Hail Batch in case nothing else works
 #### pre_process_random_pheno.py
 - Description: pre-processing data to generate the GRM for producing population-specific random phenotypes
-- Usage: `python3 pre_process_random_pheno.py --create-plink-file --create-sparse-grm --run-hail-ibd --pop all --overwrite`
+- Usage: `python3 pre_process_random_pheno.py --create-plink-file --create-sparse-grm --run-hail-ibd --ld-prune --pop all --overwrite`
 - Options: 
   - `--pop` can be a comma-separated list of any combinations from `['afr', 'amr', 'eas', 'eur', 'mid', 'sas', 'all']`
-  - `--ld-prune` whether to run ld pruning before exporting to plink files (*wei* : it should be fine to skip LD pruning here)
+  - `--ld-prune` whether to run ld pruning before exporting to plink files (required for GRM)
 #### export_vds_to_bgen.py
 - Description: chunking VDS into Bgen files each covers an interval of approximately `N_GENE_PER_GROUP` genes
 - Usage: `python3 export_vds_to_bgen.py --test --mean_impute_missing --update-vds`
