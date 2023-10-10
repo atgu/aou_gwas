@@ -1,222 +1,314 @@
 #!/usr/bin/env python3
 
-__author__ = 'wlu'
+__author__ = "wlu"
 
 import argparse
-import logging
+
+# from aou_gwas import *  # for dataproc
+from utils.utils import *  # for QoB
+from utils.resources import *  # for QoB
 from gnomad.utils.vep import *
 from gnomad.utils.filtering import *
-from ukbb_pan_ancestry import *
-from utils.resources import *
+from ukbb_common import create_gene_map_ht, post_process_gene_map_ht
 
-logger = logging.getLogger("ALL_x_AoU_preprocessing_SAIGE_data")
+# from ukbb_pan_ancestry import *
 
-BUCKET = 'gs://aou-analysis/'
-TRANCHE = '250k'
-GWAS_AF_CUTOFF = 0.001
-RVAS_AF_CUTOFF = 0.01
-CALLRATE_CUTOFF = 0.8
-N_GENE_PER_GROUP = 10
-CURRENT_BUCKET = f'{BUCKET}/{TRANCHE}'
-POPS = ('afr', 'amr', 'eas', 'eur', 'mid', 'sas')
 
 # ALL PATHs: https://support.researchallofus.org/hc/en-us/articles/4616869437204-Controlled-CDR-Directory
 # Descriptions: https://support.researchallofus.org/hc/en-us/articles/4614687617556-How-the-All-of-Us-Genomic-data-are-organized
-WGS_VDS_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/vds/hail.vds'
-WES_MT_PATH = "gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/exome/splitMT/hail.mt"
-VAT_TSV_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/vat/vat_complete.bgz.tsv.gz'
-ANCESTRY_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv'
-SAMPLE_QC_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/qc/flagged_samples.tsv'
-RELATEDNESS_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/relatedness/relatedness.tsv'
-GENE_INTERVAL_PATH = f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
+GENE_INTERVAL_PATH = (
+    f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
+)
 
-def get_aou_vep_path(tranche: str = TRANCHE):
-    return f'{CURRENT_BUCKET}/util/aou_vep_{tranche}.ht'
 
-def get_aou_vat_path(tranche: str = TRANCHE):
-    return f'{CURRENT_BUCKET}/util/aou_vat_{tranche}.ht'
+def mac_category_case_builder(call_stats_ac_expr, call_stats_af_expr):
+    return (
+        hl.case()
+        .when(call_stats_ac_expr <= 5, call_stats_ac_expr)
+        .when(call_stats_ac_expr <= 10, 10)
+        .when(call_stats_ac_expr <= 20, 20)
+        .when(call_stats_af_expr <= 0.001, 0.001)
+        .when(call_stats_af_expr <= 0.01, 0.01)
+        .when(call_stats_af_expr <= 0.1, 0.1)
+        .default(0.99)
+    )
 
-def get_aou_grm_mt_path(pop: str, data_iteration:int, tranche: str = TRANCHE):
-    suffix = f'_{data_iteration}' if data_iteration else ""
-    return f'{CURRENT_BUCKET}/grm/aou_{pop}_for_grm{suffix}_{tranche}.mt'
 
-def get_aou_grm_pruned_ht_path(pop: str, window_size: str = '1e6', tranche: str = TRANCHE):
-    cut = '' if window_size == '1e6' else f'_{window_size}'
-    return f'{CURRENT_BUCKET}/grm/aou_{pop}_for_grm_pruned{cut}_{tranche}.ht'
+def filter_ht_for_plink(
+    ht: hl.Table,
+    pop: str,
+    min_call_rate: float = 0.95,
+    variants_per_mac_category: int = 2000,
+    variants_per_maf_category: int = 10000,
+):
+    ht = ht.filter(
+        (ht.locus.in_autosome())
+        & (ht.info.AN >= N_SAMPLES[pop] * 2 * min_call_rate)
+        & (ht.info.AC[0] > 0)
+    )
+    ht = ht.annotate(
+        mac_category=mac_category_case_builder(ht.info.AC[0], ht.info.AF[0])
+    )
 
-def get_aou_grm_plink_path(pop: str, data_iteration: int = 0, window_size: str = '1e6', tranche: str = TRANCHE):
-    suffix = f'.{data_iteration}' if data_iteration else ""
-    cut = '' if window_size == '1e6' else f'.{window_size}'
-    return f'{CURRENT_BUCKET}/grm/aou_{pop}_for_grm{suffix}_pruned{cut}_{tranche}.plink'
+    # From: https://hail.zulipchat.com/#narrow/stream/123010-Hail-Query-0.2E2-support/topic/.E2.9C.94.20randomly.20sample.20table/near/388162012
+    bins = ht.aggregate(hl.agg.collect_as_set(ht.mac_category))
+    ac_bins = [bin for bin in bins if bin >= 1]
+    print(ac_bins)
+    af_bins = [bin for bin in bins if bin < 1]
+    print(af_bins)
 
-def get_vat_field_types():
-    tags = ('afr', 'amr', 'asj', 'eas', 'eur', 'fin', 'mid', 'nfr', 'sas', 'oth', 'max', 'all')
-    fields = ('ac', 'an', 'sc')
-    types = {}
-    for tag in tags:
-        types[f'gvs_{tag}_af'] = hl.tfloat64
-        types[f'gnomad_{tag}_af'] = hl.tfloat64
-        for field in fields:
-            types[f'gvs_{tag}_{field}'] = hl.tint32
-            types[f'gnomad_{tag}_{field}'] = hl.tint32
-    types['is_canonical_transcript'] = hl.tbool
-    types['omim_phenotypes_id'] = hl.tarray(hl.tint32)
-    for x in ['position', 'gene_omim_id', 'splice_ai_acceptor_gain_distance', 'splice_ai_acceptor_loss_distance',
-              'splice_ai_donor_gain_distance', 'splice_ai_donor_loss_distance']:
-        types[x] = hl.tint32
-    for x in ['revel', 'splice_ai_acceptor_gain_score', 'splice_ai_acceptor_loss_score', 'splice_ai_donor_gain_score',
-              'splice_ai_donor_loss_score']:
-        types[x] = hl.tfloat64
-    for x in ['omim_phenotypes_name', 'clinvar_classification', 'clinvar_phenotype', 'consequence', 'dbsnp_rsid']:
-        types[x] = hl.tarray(hl.tstr)
-    return types
+    binned_samples_ac = ht.aggregate(
+        hl.agg.array_agg(
+            lambda x: hl.agg.filter(
+                ht.mac_category == x,
+                hl.agg._reservoir_sample(ht.key, variants_per_mac_category),
+            ),
+            hl.literal(ac_bins),
+        )
+    )
+    binned_samples_af = ht.aggregate(
+        hl.agg.array_agg(
+            lambda x: hl.agg.filter(
+                ht.mac_category == x,
+                hl.agg._reservoir_sample(ht.key, variants_per_maf_category),
+            ),
+            hl.literal(af_bins),
+        ),
+    )
+    binned_samples = binned_samples_ac + binned_samples_af
+
+    samples = [sample for bin in binned_samples for sample in bin]
+    ht = hl.Table.parallelize(samples).key_by(*ht.key.keys())
+
+    return ht
 
 
 def main(args):
-    hl.init(default_reference='GRCh38')
+    hl.init(default_reference="GRCh38")
 
-    # Load and VDS and split-multi
-    vds = hl.vds.read_vds(WGS_VDS_PATH)
-    # Pre splitting multi: vmt: (1031611675, 245394), rmt: (2853640141, 245394)
-    vds = hl.vds.split_multi(vds, filter_changed_loci=False)
+    # Load info tables
+    vat_ht = hl.read_table(get_aou_util_path(name="vat"))
+    vat_ht = vat_ht.collect_by_key()
 
-    # Load variant info table and re-format
-    vat_ht = hl.import_table(VAT_TSV_PATH, force=True, quote='"', delimiter="\t", force_bgz=True, types = get_vat_field_types())
-    vat_ht = vat_ht.key_by(locus=hl.locus(vat_ht.contig, vat_ht.position, reference_genome='GRCh38'),
-                           alleles=[vat_ht.ref_allele, vat_ht.alt_allele])
-    vat_ht = vat_ht.checkpoint(get_aou_vat_path(), _read_if_exists=not args.overwrite, overwrite=args.overwrite)
-    vat_ht = vat_ht.filter(vat_ht.gvs_all_ac > 0)
-    pop_ht = hl.import_table(ANCESTRY_PATH, key="research_id", impute=True,
-                             types={"research_id": "tstr", "pca_features": hl.tarray(hl.tfloat)})
-    # {'afr': 56913, 'amr': 45035, 'eas': 5706, 'eur': 133581, 'mid': 942, 'sas': 3217} - Total: 245394
-
-    if args.test:
-        # filter to the first 1% partition (Total: 84648 partitions)
-        n_partitions = round(vds.variant_data.n_partitions()*0.01)
-        vds = hl.vds.VariantDataset(vds.reference_data._filter_partitions(range(n_partitions)),
-                                    vds.variant_data._filter_partitions(range(n_partitions)))
-
-
-    pops = args.pops.split(',') if args.pops else POPS
-
-    if args.vep:
+    if args.run_vep:
         # Vep resource from gnomAD:
         # https://github.com/broadinstitute/gnomad_methods/blob/e2f2b055a2d40991851e7852dea435b4eaef45ea/gnomad/resources/grch38/reference_data.py#L100
-        vep_ht = vep_or_lookup_vep(vat_ht, vep_version='105')
-        vep_ht.write(get_aou_vep_path(), args.overwrite)
+        if (not hl.hadoop_exists(get_aou_util_path(name="vep_corrected"))) or args.overwrite:
+            # vep_ht = vep_or_lookup_vep(vat_ht, vep_version="vep105") # with init file: gs://gcp-public-data--gnomad/resources/vep/v105/vep105-init.sh
+            vep_ht = hl.vep(vat_ht, csq=True)  # with init file: gs://aou_analysis/vep105-init_mod.sh
+            vep_ht.write(
+                get_aou_util_path(name="vep_corrected"),
+                overwrite=args.overwrite,
+            )
+        vep_ht = hl.read_table(get_aou_util_path(name="vep_corrected"))
+        vep_ht.describe()
+
+    if args.create_gene_mapping_files:  # TODO: run this once VEP table is ready
+        ht = hl.read_table(get_aou_util_path(name="vep_corrected"))
+        qual_ht = hl.read_table(
+            get_ukb_exomes_qual_ht_path(CURRENT_TRANCHE)
+        )  # TODO: find the correct quality filter
+        qual_ht = qual_ht.filter(hl.len(qual_ht.filters) == 0)
+        call_stats_ht = hl.read_table(get_aou_util_path(name="vat"))
+        call_stats_ht = call_stats_ht.collect_by_key()
+        pops = args.pops.split(",") if (args.pops is not None) else POPS
+        for pop in pops:
+            max_an = call_stats_ht.aggregate(
+                hl.struct(
+                    autosomes=hl.agg.max(call_stats_ht.values[f"gvs_{pop}_an"]),
+                    x=hl.agg.filter(
+                        call_stats_ht.locus.in_x_nonpar(),
+                        hl.agg.max(call_stats_ht.values[f"gvs_{pop}_an"]),
+                        y=hl.agg.filter(
+                            call_stats_ht.locus.in_y_nonpar(),
+                            hl.agg.max(call_stats_ht.values[f"gvs_{pop}_an"]),
+                        ),
+                    ),
+                )
+            )
+            an = call_stats_ht.values[f"gvs_{pop}_an"]
+            call_stats_ht = call_stats_ht.filter(
+                hl.case()
+                .when(call_stats_ht.locus.in_x_nonpar(), an > 0.8 * max_an.x)
+                .when(call_stats_ht.locus.in_y_nonpar(), an > 0.8 * max_an.y)
+                .default(an > 0.8 * max_an.autosomes)
+            )
+            ht = ht.annotate(freq=call_stats_ht[ht.key].values[f"gvs_{pop}_af"][0])
+            ht = ht.filter(hl.is_defined(qual_ht[ht.key]) & hl.is_defined(ht.freq))
+            gene_map_ht = create_gene_map_ht(ht, freq_field=ht.freq)
+            gene_map_ht.write(
+                get_aou_util_path(name="gene_map", parsed=False), args.overwrite
+            )
+
+            gene_map_ht = hl.read_table(
+                get_aou_util_path(name="gene_map", parsed=False)
+            )
+            gene_map_ht = post_process_gene_map_ht(gene_map_ht, freq_cutoff=0.01)
+            gene_map_ht.write(
+                get_aou_util_path(name="gene_map", parsed=True), args.overwrite
+            )
 
     if args.create_plink_file:
-        window = args.window
-        # Note: 1e7 LD pruning for EUR was run with r2=0.05, and chr8 inversion and HLA were removed
-        r2 = 0.1 if args.window != '1e7' else 0.05
-        iteration = 1
-        for pop in pops:
-            # Filter samples
-            sub_pop_ht = pop_ht.filter(pop_ht.ancestry_pred == pop)
-            sub_vds = hl.vds.filter_samples(vds, sub_pop_ht, keep=True, remove_dead_alleles=True)
-            n_samples = sub_vds.variant_data.count_cols()
-            print(f'Got {n_samples} samples for {pop}...')
-
-            # Filter variants
-            call_stats_ht = vat_ht.select(
-                AF=hl.float64(vat_ht[f'gvs_{pop}_af']),
-                AC=vat_ht[f'gvs_{pop}_ac'],
-                AN=vat_ht[f'gvs_{pop}_an'],
-                N=vat_ht[f'gvs_{pop}_sc'],
-            ) # with_x = False?
-            if args.data_type == 'gwas':
-                call_stats_ht = call_stats_ht.filter(call_stats_ht.AF > GWAS_AF_CUTOFF)
-            elif args.data_type == 'rvas':
-                int_ht = hl.read_table(GENE_INTERVAL_PATH)
-                sub_vds = hl.vds.filter_intervals(sub_vds, int_ht, keep=True)
-                call_stats_ht = call_stats_ht.filter(call_stats_ht.AF < RVAS_AF_CUTOFF)
+        pop_ht = hl.read_table(get_aou_util_path(name="ancestry_preds", parsed=True))
+        # {'afr': 56913, 'amr': 45035, 'eas': 5706, 'eur': 133581, 'mid': 942, 'sas': 3217} - Total: 245394
+        analysis_type = "variant" if args.single_variant_only else "gene"
+        if not args.dataproc:
+            if analysis_type == "variant":
+                mt = hl.read_matrix_table(ACAF_MT_PATH)
             else:
-                logger.warning('INVALID TEST TYPE...')
+                mt = hl.read_matrix_table(EXOME_MT_PATH)
 
-            call_stats_ht = call_stats_ht.filter(call_stats_ht.AN/(2*n_samples) > CALLRATE_CUTOFF)
-            sub_vds = hl.vds.filter_chromosomes(sub_vds, keep_autosomes=True)
-            sub_vds = hl.vds.filter_variants(sub_vds, call_stats_ht, keep=True)
+            if args.test:
+                mt = mt.filter_rows(mt.locus.contig == "chr1")
 
-            print('Removing HLA...')
-            # Common inversion taken from Table S4 of https://www.ncbi.nlm.nih.gov/pubmed/27472961
-            # (converted to GRCh38 by: https://liftover.broadinstitute.org/#input=chr8%3A8055789-11980649&hg=hg19-to-hg38 )
-            # Also removing HLA, from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38
-            sub_vds = hl.vds.filter_intervals(sub_vds,
-                                              hl.literal([hl.parse_locus_interval('chr8:8198267-12123140', reference_genome='GRCh38'),
-                                                          hl.parse_locus_interval('chr6:28510120-33480577', reference_genome='GRCh38')]),
-                                              keep=False)
-            mt = hl.vds.to_dense_mt(sub_vds)
-            mt = mt.checkpoint(get_aou_grm_mt_path(pop, iteration), _read_if_exists=not args.overwrite, overwrite=args.overwrite)
-            mt = mt.unfilter_entries()
+        pops = args.pops.split(",") if (args.pops is not None) else POPS
+        for pop in pops:
+            # Note: 1e7 LD pruning for EUR was run with r2=0.05, and chr8 inversion and HLA were removed
+            window = "1e7" if pop == "eur" else "1e6"
+            r2 = 0.05 if (window == "1e7") and (analysis_type == "variant") else 0.1
+            iteration = 1
+            pop_mt_path = get_aou_saige_plink_path(
+                analysis_type=analysis_type,
+                pop=pop,
+                extension="mt",
+                pruned=False,
+                data_iteration=iteration,
+                test=args.test,
+            )
+            pop_ld_ht_path = get_aou_saige_plink_path(
+                analysis_type=analysis_type,
+                pop=pop,
+                extension="ht",
+                pruned=True,
+                window_size=window,
+                test=args.test,
+            )
+            pop_plink_path = get_aou_saige_plink_path(
+                analysis_type=analysis_type,
+                pop=pop,
+                extension="plink",
+                pruned=True,
+                data_iteration=iteration,
+                window_size=window,
+                test=args.test,
+            )
+            if not hl.hadoop_exists(f"{pop_mt_path}/_SUCCESS"):
+                # Filter samples
+                sub_pop_ht = pop_ht.filter(pop_ht.ancestry_pred == pop)
+                sub_mt = mt.filter_cols(hl.is_defined(sub_pop_ht[mt.col_key]))
+                n_samples = sub_mt.count_cols()
+                print(f"Got {n_samples} samples for {pop}...")
 
-            if not args.omit_ld_prune:
-                print(f'LD-pruning to {get_aou_grm_pruned_ht_path(pop, window)}...')
-                ht = hl.ld_prune(mt.LGT, r2=float(r2), bp_window_size=int(float(window)), block_size=1024)
-                ht.write(get_aou_grm_pruned_ht_path(pop, window), overwrite=args.overwrite)
-            ht = hl.read_table(get_aou_grm_pruned_ht_path(pop, window))
-            mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
+                # Filter variants
+                # sub_mt = sub_mt.filter_rows(sub_mt.locus.in_autosome()) # TODO: double check that we want to keep sex chromosomes
+                if analysis_type == "variant":
+                    sub_mt = sub_mt.filter_rows(sub_mt.info.AF[0] >= 0.01)
+                else:
+                    sampled_variants_ht = filter_ht_for_plink(ht=sub_mt.rows(), pop=pop)
+                    sampled_variants_ht = sampled_variants_ht.naive_coalesce(1000).checkpoint(
+                        get_aou_saige_plink_path(
+                            analysis_type=analysis_type,
+                            pop=pop,
+                            extension="ht",
+                            pruned=False,
+                            window_size="1e6",
+                            test=args.test,
+                        ),
+                        _read_if_exists=not args.overwrite,
+                        overwrite=args.overwrite,
+                    )
+                    sub_mt = sub_mt.filter_rows(
+                        hl.is_defined(sampled_variants_ht[sub_mt.row_key])
+                    )
 
-            ## TODO: check numbers of variants per population
-            ## mt = mt.filter_rows(hl.rand_bool(0.55))
+                if pop == "eur" and analysis_type == "variant":
+                    print("Removing HLA...")
+                    # Common inversion taken from Table S4 of https://www.ncbi.nlm.nih.gov/pubmed/27472961
+                    # (converted to GRCh38 by: https://liftover.broadinstitute.org/#input=chr8%3A8055789-11980649&hg=hg19-to-hg38 )
+                    # Also removing HLA, from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38
+                    sub_mt = sub_mt.filter_rows(
+                        ~hl.parse_locus_interval(
+                            "chr8:8198267-12123140", reference_genome="GRCh38"
+                        ).contains(sub_mt.locus)
+                        & ~hl.parse_locus_interval(
+                            "chr6:28510120-33480577", reference_genome="GRCh38"
+                        ).contains(sub_mt.locus)
+                    )
+                print(f"Exporting {pop.upper()} MT to {pop_mt_path}")
+                sub_mt = sub_mt.naive_coalesce(1000).checkpoint(
+                    pop_mt_path,
+                    _read_if_exists=not args.overwrite,
+                    overwrite=args.overwrite,
+                )
+            sub_mt = hl.read_matrix_table(pop_mt_path)
 
-            if args.overwrite or not hl.hadoop_exists(f'{get_aou_grm_plink_path(pop, iteration, window)}.bed'):
-                print(f'Exporting plink to {get_aou_grm_plink_path(pop, iteration, window)}...')
-                hl.export_plink(mt, get_aou_grm_plink_path(pop, iteration, window))
+            if (not args.omit_ld_prune) and (args.dataproc):
+                # This has to be run on dataproc, QoB hits transient error:
+                # Error summary: GoogleJsonResponseException: 404 Not Found @ hail==0.2.124
+                print(f"LD-pruning to {pop_ld_ht_path}...")
+                ht = hl.ld_prune(
+                    sub_mt.GT,
+                    r2=float(r2),
+                    bp_window_size=int(float(window)),
+                    block_size=1024,
+                )
+                ht.write(pop_ld_ht_path, overwrite=not args.omit_ld_prune)
 
-    # if args.genotype_summary:
-    #     variants = hl.read_table(ukb_imputed_info_ht_path)
-    #     print(variants.count())
-    #     variants = variants.filter(variants.info > 0.8)
-    #     print(variants.count())
-    #     meta_ht = hl.import_table(get_ukb_meta_pop_tsv_path(), impute=True, types={'s': hl.tstr}, key='s')
-    #
-    #     mt = get_ukb_imputed_data('all', variant_list=variants, entry_fields=('dosage', ))
-    #     mt = mt.annotate_cols(**meta_ht[mt.col_key])
-    #     ht = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
-    #                           an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
-    #     ht = ht.checkpoint(get_ukb_af_ht_path(False), args.overwrite, _read_if_exists=not args.overwrite)
-    #
-    #     mt = get_ukb_imputed_data('X', variant_list=variants, entry_fields=('dosage', ))
-    #     mt = mt.annotate_cols(**meta_ht[mt.col_key])
-    #     ht_x = mt.annotate_rows(af=hl.agg.group_by(mt.pop, hl.agg.mean(mt.dosage)),
-    #                           an=hl.agg.group_by(mt.pop, hl.agg.count_where(hl.is_defined(mt.dosage)))).rows()
-    #     ht = ht.union(ht_x)
-    #     ht = ht.checkpoint(get_ukb_af_ht_path(), args.overwrite, _read_if_exists=not args.overwrite)
-    #     ht = ht.naive_coalesce(1000).checkpoint(get_ukb_af_ht_path(repart=True), args.overwrite, _read_if_exists=not args.overwrite)
-    #
-    #     print(ht.aggregate(hl.struct(
-    #         # hist=hl.agg.hist(hl.sum(ht.an.values()), 0, total_samples, 10),  # No missing data
-    #         # fraction_missingness=hl.agg.fraction(hl.sum(ht.an.values()) < total_samples),
-    #         # number_sites_above_001=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.001, ht.af.values())),
-    #         # number_sites_above_005=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.005, ht.af.values())),
-    #         # number_sites_above_01=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.01, ht.af.values())),
-    #         # number_sites_above_05=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.05, ht.af.values())),
-    #         # number_sites_above_10=hl.agg.count_where(hl.any(lambda x: x / 2 > 0.1, ht.af.values()))
-    #         number_sites_above_mac_20=hl.agg.count_where(hl.any(lambda x: ht.af[x] * ht.an[x] >= 20, hl.literal(POPS))),
-    #         number_run_sites_above_mac_20=hl.agg.sum(hl.sum(hl.map(lambda x: hl.int(ht.af[x] * ht.an[x] >= 20), hl.literal(POPS))))
-    #     )))
+            if hl.hadoop_exists(f"{pop_ld_ht_path}/_SUCCESS"):
+                sub_mt = sub_mt.unfilter_entries()
+                ht = hl.read_table(pop_ld_ht_path)
+                sub_mt = sub_mt.filter_rows(hl.is_defined(ht[sub_mt.row_key]))
+
+                ## TODO: check numbers of variants per population
+                ## if pop == 'EUR':
+                ## sub_mt = sub_mt.filter_rows(hl.rand_bool(0.55))
+
+                if args.overwrite or not hl.hadoop_exists(f"{pop_plink_path}.bed"):
+                    print(f"Exporting plink to {pop_plink_path}...")
+                    hl.export_plink(sub_mt, pop_plink_path)
+
+                # TODO: residualize GRM by first 20 PCs
+                if args.overwrite or not hl.hadoop_exists(
+                    get_aou_samples_file_path(
+                        analysis_type=analysis_type, pop=pop, data_iteration=iteration
+                    )
+                ):
+                    with hl.hadoop_open(
+                        get_aou_samples_file_path(
+                            analysis_type=analysis_type,
+                            pop=pop,
+                            data_iteration=iteration,
+                        ), "w",) as f:
+                        f.write("\n".join(sub_mt.s.collect()) + "\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-type", nargs=1, help="Type of analysis to conduct", default="gwas", choices=["gwas", "rvas"])
-    parser.add_argument("--test", help="Whether to run test on a subset of the data", action="store_true")
-    parser.add_argument('--pheno_summary', action='store_true')
-    parser.add_argument('--prepare_genotype_data', action='store_true')
-    parser.add_argument('--genotype_summary', action='store_true')
-    parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
-    parser.add_argument('--omit_ld_prune', help='Overwrite everything', action='store_true')
-    parser.add_argument('--window', help='Overwrite everything', default='1e6')
-    parser.add_argument('--pops', help='Comma-separated list of pops to run', default=['afr', 'amr', 'eas', 'eur', 'mid', 'sas'])
-    parser.add_argument('--create_plink_file', help='Overwrite everything', action='store_true')
-    parser.add_argument('--vep', help='Overwrite everything', action='store_true')
-    parser.add_argument('--slack_channel', help='Send message to Slack channel/user', default='@wlu')
+    parser.add_argument(
+        "--single_variant_only", help="Run single variant SAIGE", action="store_true"
+    )
+    parser.add_argument(
+        "--test",
+        help="Whether to run test on a subset of the data (e.g. chr1)",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--dataproc",
+        help="Whether to run the pipeline on dataproc",
+        action="store_true",
+    )
+    parser.add_argument("--overwrite", help="Overwrite everything", action="store_true")
+    parser.add_argument(
+        "--omit_ld_prune", help="Overwrite everything", action="store_true"
+    )
+    parser.add_argument(
+        "--pops",
+        help="Comma-separated list of pops to run",
+        default="afr,amr,eas,eur,mid,sas",
+    )
+    parser.add_argument(
+        "--create_plink_file", help="Overwrite everything", action="store_true"
+    )
+    parser.add_argument("--run_vep", help="Run Vep on the VAT", action="store_true")
     args = parser.parse_args()
-
-    # if args.slack_channel:
-    #     try_slack(args.slack_channel, main, args)
-    # else:
-    #     main(args)
     main(args)
-
-# hailctl dataproc submit wlu2 ~/PycharmProjects/ukbb_pan_ancestry/pre_process_saige_data.py --create_plink_file --window 1e7 --pops all
