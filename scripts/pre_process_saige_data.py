@@ -35,7 +35,7 @@ def main(args):
         worker_cores=1,
         default_reference="GRCh38",
         log="/pre_process_saige_data.log",
-        app_name='gene_map'
+        app_name=app_name
     )
 
     # Load info tables
@@ -65,6 +65,7 @@ def main(args):
         # qual_ht = qual_ht.filter(hl.len(qual_ht.filters) == 0)
         call_stats_ht = hl.read_table(get_aou_util_path(name="vat"))
         call_stats_ht = call_stats_ht.collect_by_key()
+        call_stats_ht = call_stats_ht.filter()
         pops = args.pops.split(",") if (args.pops is not None) else POPS
         for pop in pops:
             print(pop)
@@ -185,6 +186,9 @@ def main(args):
         mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
         if args.relatedness_type == "ibd":
             print(f"-------------Running hl.identity_by_descent() -----------")
+            mt = mt.unfilter_entries()
+            mt = mt.annotate_entries(mean_gt = mt.aggregate_entries(hl.agg.mean(mt.GT.n_alt_alleles(), _localize=False)))
+            mt = mt.annotate_entries(GT = hl.or_missing(mt.GT, mt.mean_gt))
             relatedness_ht = hl.identity_by_descent(mt, maf=mt.info.AF[0])
             if args.overwrite or (
                     not hl.hadoop_exists(f'{get_aou_relatedness_path(extension="ht")}')
