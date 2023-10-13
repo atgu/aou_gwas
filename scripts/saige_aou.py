@@ -510,20 +510,22 @@ def main(args):
             )
 
             bgens = {}
-            for chrom in chromosomes:
-                chromosome = f"chr{chrom}"
-                chrom_length = chrom_lengths[chromosome]
-                if analysis_type == "gene":
-                    if args.groups is None:
-                        groups = ["pLoF", "missense|LC", "synonymous"]
-                    else:
-                        groups = args.groups.split(",")
-                    interval_ht = hl.read_table(GENE_INTERVAL_PATH)
-                    intervals = interval_ht.aggregate(
-                        hl.agg.collect(interval_ht.interval)
-                    )
+            if analysis_type == "gene":
+                if args.groups is None:
+                    groups = ["pLoF", "missense|LC", "synonymous"]
                 else:
-                    intervals = []
+                    groups = args.groups.split(",")
+                interval_ht = hl.read_table(GENE_INTERVAL_PATH)
+                intervals = interval_ht.aggregate(
+                    hl.agg.collect(interval_ht.interval)
+                )
+            else:
+                intervals = []
+                if args.test:
+                    chromosomes = chromosomes[0]
+                for chrom in chromosomes:
+                    chromosome = f"chr{chrom}"
+                    chrom_length = chrom_lengths[chromosome]
                     for start_pos in range(1, chrom_length, chunk_size):
                         end_pos = (
                             chrom_length
@@ -538,58 +540,56 @@ def main(args):
                         )
                         intervals.append(interval)
 
-                if args.test:
-                    intervals = intervals[:10]
+            if args.test:
+                intervals = intervals[:10]
 
-                for interval in intervals:
-                    bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
-                    if f"{bgen_root}.bgen" not in bgens_already_created:
-                        bgen_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{interval}_bgen"
-                        )
-                        bgen_task.image(HAIL_DOCKER_IMAGE)
-                        bgen_task.call(
-                            export_bgen_from_mt,
-                            pop=pop,
-                            analysis_type=analysis_type,
-                            interval=interval,
-                            output_dir=bgen_dir,
-                            mean_impute_missing=args.mean_impute_missing,
-                            no_adj=args.no_adj,
-                            variant_ac_filter= 0,
-                            variant_callrate_filter=0
-                        )
-                        bgen_task.attributes["pop"] = pop
-                        bgen_task.attributes["analysis_type"] = analysis_type
-                    if (f"{bgen_root}.gene.txt" not in bgens_already_created) and analysis_type=='gene':
-                        gene_txt_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{interval}_gene_txt"
-                        )
-                        gene_txt_task.image(HAIL_DOCKER_IMAGE)
-                        gene_txt_task.call(
-                            export_gene_group_file,
-                            interval=interval,
-                            groups=groups,
-                            output_dir=f"{bgen_root}.gene.txt",
-                        )
-                        gene_txt_task.attributes["pop"] = pop
-
-                    bgen_file = b.read_input_group(
-                        **{
-                            "bgen": f"{bgen_root}.bgen",
-                            "bgen.bgi": f"{bgen_root}.bgen.bgi",
-                            "sample": f"{bgen_root}.sample",
-                        }
+            for interval in intervals:
+                bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+                if f"{bgen_root}.bgen" not in bgens_already_created:
+                    bgen_task = b.new_python_job(
+                        name=f"{analysis_type}_analysis_export_{interval}_bgen"
                     )
-                    if analysis_type == 'gene':
-                        group_file = b.read_input(f"{bgen_root}.gene.txt")
-                        bgens[hl.str(interval)] = (bgen_file, group_file)
-                    else:
-                        bgens[hl.str(interval)] = bgen_file
-                    if args.test:
-                        break
-                if args.test:
-                    break
+                    bgen_task.image(HAIL_DOCKER_IMAGE)
+                    bgen_task.call(
+                        export_bgen_from_mt,
+                        pop=pop,
+                        analysis_type=analysis_type,
+                        interval=interval,
+                        output_dir=bgen_dir,
+                        mean_impute_missing=args.mean_impute_missing,
+                        no_adj=args.no_adj,
+                        variant_ac_filter= 0,
+                        variant_callrate_filter=0
+                    )
+                    bgen_task.attributes["pop"] = pop
+                    bgen_task.attributes["analysis_type"] = analysis_type
+                if (f"{bgen_root}.gene.txt" not in bgens_already_created) and analysis_type=='gene':
+                    gene_txt_task = b.new_python_job(
+                        name=f"{analysis_type}_analysis_export_{interval}_gene_txt"
+                    )
+                    gene_txt_task.image(HAIL_DOCKER_IMAGE)
+                    gene_txt_task.call(
+                        export_gene_group_file,
+                        interval=interval,
+                        groups=groups,
+                        output_dir=f"{bgen_root}.gene.txt",
+                    )
+                    gene_txt_task.attributes["pop"] = pop
+
+                bgen_file = b.read_input_group(
+                    **{
+                        "bgen": f"{bgen_root}.bgen",
+                        "bgen.bgi": f"{bgen_root}.bgen.bgi",
+                        "sample": f"{bgen_root}.sample",
+                    }
+                )
+                if analysis_type == 'gene':
+                    group_file = b.read_input(f"{bgen_root}.gene.txt")
+                    bgens[hl.str(interval)] = (bgen_file, group_file)
+                else:
+                    bgens[hl.str(interval)] = bgen_file
+            if args.test:
+                break
         b.run()
 
         #     result_dir = get_aou_saige_root(
