@@ -1,5 +1,6 @@
 # ALL PATHs in the workbech: https://support.researchallofus.org/hc/en-us/articles/4616869437204-Controlled-CDR-Directory
 # Descriptions: https://support.researchallofus.org/hc/en-us/articles/4614687617556-How-the-All-of-Us-Genomic-data-are-organized
+import hail as hl
 
 ##################### ROOT PATHs #####################
 TRANCHE = "250k"
@@ -20,7 +21,7 @@ MIN_CALL_RATE = {
     "amr": 0.85,
     "eas": 0.9,
     "eur": 0.95,
-    "mid": 0.55,
+    "mid": 0,
     "sas": 0.7,
 }
 SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.3.0"
@@ -58,7 +59,7 @@ TRAIT_TYPEs = ["physical_measurement", "r_drug", "pfhh_survey", "mcc2_phecode"]
 
 ORIGINAL_CALLSET_PATH = f"{ORIGINAL_GENO_ROOT}/aou-wgs-delta-small_callsets_gq0/v7.1"
 ACAF_MT_PATH = f"{ORIGINAL_CALLSET_PATH}/acaf_threshold_v7.1/splitMT/delta_basis_without_ext_aian_prod_gq0_3regions.acaf_threshold.split.mt"
-EXOME_MT_PATH = f"{ORIGINAL_CALLSET_PATH}/exome_v7.1/splitMT/delta_basis_without_ext_aian_prod_gq0_3regions.exome.split.mt"
+EXOME_MT_PATH = f"{ORIGINAL_CALLSET_PATH}/exome_v7.1/splitMT/delta_basis_without_ext_aian_prod_gq0_3regions.exome.split.mt" # (34807589, 245394)
 VDS_PATH = f"{ORIGINAL_GENO_ROOT}/v7/wgs/without_ext_aian_prod/vds/aou_srwgs_short_variants_v7_without_ext_aian_prod.vds"
 
 ORIGINAL_UTIL_PATH = f"{ORIGINAL_GENO_ROOT}/aou-wgs-delta-aux_gq0"
@@ -136,17 +137,21 @@ def get_aou_util_path(
         "relatedness",
         "relatedness_flagged_samples",
         "vat",
+        "mt_sample_qc",
+        "acaf_mt_sample_qc",
+        "vds_sample_qc",
         "sample_qc",
+        "variant_qc"
         "sample_qc_tmp",
         "vep_corrected",
-        "gene_map",
-    ], 'Name has to be from ["ancestry_preds", "relatedness", "relatedness_flagged_samples", "vat", "sample_qc", "sample_qc_tmp", "vep_corrected", "gene_map"]'
+        "vep_old",
+    ], 'Name has to be from ["ancestry_preds", "relatedness", "relatedness_flagged_samples", "vat", "mt_sample_qc", "vds_sample_qc","sample_qc", "variant_qc", "sample_qc_tmp", "vep_corrected", "vep_old"]'
     tag1 = (name == "ancestry_preds") and parsed
     tag2 = (name == "gene_map") and parsed
     if name == "vat":
         # gsutil -m cp -r gs://aou_wlu/utils/vat/hail_0_2_107/aou_PARSED_SORTED_vat.ht gs://aou_analysis/250k/data/utils/aou_parsed_and_sorted_vat_hail_0_2_107_250k.ht
         name = "parsed_and_sorted_vat_hail_0_2_107"
-    return f'{DATA_PATH}/utils/aou_{name}{"_parsed" if tag1 else ""}{"" if tag1 else "_raw"}_{tranche}.{extension}'
+    return f'{DATA_PATH}/utils/aou_{name}{"_parsed" if tag1 else ""}{"_processed" if tag2 else ""}_{tranche}.{extension}'
 
 
 def get_aou_relatedness_path(extension: str = "ht", tranche: str = TRANCHE):
@@ -167,39 +172,49 @@ GENE_INTERVAL_PATH = (
 )
 
 
-def get_aou_saige_root(analysis_type: str, pop: str, name: str, test: bool = False):
+def get_aou_saige_results_root(analysis_type: str, pop: str, name: str, test: bool = False):
     assert analysis_type in [
         "gene",
         "variant",
     ], "Name has to be from ['gene', 'variant']"
     assert name in [
         "bgen",
-        "null_glmm",
         "result",
-        "plink",
-    ], "Name has to be from ['bgen', 'null_glmm', 'result', 'plink']"
+    ], "Name has to be from ['bgen', 'result']"
     return f'{CURRENT_PATH}/{analysis_type}_results/{name}/{"test" if test else pop.upper()}'
 
 
-def get_aou_pheno_file_path(pop: str, phenocode: str, extension: str = "tsv"):
-    return f"{CURRENT_PATH}/pheno_file/{pop.upper()}/phenotype_{phenocode}.{extension}"
+def get_aou_saige_utils_root(pop: str, name: str, test: bool = False, random_pheno: bool = False):
+    assert name in [
+        "pheno_file",
+        "null_glmm",
+    ], "Name has to be from ['pheno_file', 'null_glmm']"
+    return f"{CURRENT_PATH}/{name}/{'test' if test else pop.upper()}{'/random_pheno' if random_pheno else ''}"
 
-
-def get_aou_saige_plink_path(
-    analysis_type: str,
-    pop: str,
-    extension: str,
-    pruned: bool,
-    data_iteration: int = 0,
-    window_size: str = "1e6",
-    test: bool = False,
-):
-    suffix = f"_{data_iteration}" if data_iteration else ""
-    cut = "" if window_size == "1e6" else f"_{window_size}"
-    pruned = "_pruned" if pruned else ""
-    return f'{get_aou_saige_root(analysis_type=analysis_type, pop=pop, name="plink", test=test)}/aou_{pop}_saige_grm{suffix}{pruned}{cut}.{extension}'
-
-
-def get_aou_samples_file_path(analysis_type: str, pop: str, data_iteration: int = 0):
-    suffix = f"_{data_iteration}" if data_iteration else ""
-    return f'{get_aou_saige_root(analysis_type=analysis_type, pop=pop, name="plink")}/aou_{pop}{suffix}.samples'
+#################
+def get_filtered_mt(analysis_type: str, pop: str, filter_samples: bool=True, filter_variants: bool=True, adj_filter: bool=True):
+    from gnomad.utils.annotations import annotate_adj
+    mt_path = EXOME_MT_PATH if analysis_type=='gene' else ACAF_MT_PATH
+    mt = hl.read_matrix_table(mt_path)
+    meta_ht = hl.read_table(get_sample_meta_path(annotation=True))
+    mt = mt.annotate_cols(**meta_ht[mt.col_key])
+    if pop is not None:
+        mt = mt.filter_cols(mt.pop==pop)
+    if filter_variants:
+        mt = mt.filter_rows(
+            (hl.len(mt.filters) == 0) & # TODO: update this with the VDS filters
+            (mt.info.AC[0] > 0)
+        )
+    if filter_samples:
+        mt = mt.filter_cols(mt.samples_to_keep)
+    if adj_filter:
+        """
+        Filter genotypes to adj criteria - Default: 
+        GQ >= 20, haploid_DP >= 5, else_DP >= 10, 
+        het_ref_altAB >= 0.2, het_non_ref_altAB >= 0.2 , het_non_ref_refAB > =0.2
+        """
+        mt= mt.annotate_entries(DP=hl.sum(mt.AD))
+        mt = annotate_adj(mt)
+        mt = mt.filter_entries(mt.adj)
+        mt = mt.filter_rows(hl.agg.any(mt.GT.n_alt_alleles() >0))
+    return mt

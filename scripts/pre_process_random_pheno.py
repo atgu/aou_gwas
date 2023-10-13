@@ -26,12 +26,25 @@ def get_aou_sites_for_grm_path(
 
 
 ####### STEP 1: Downsample a bunch of sites based on frequency for the GRM  #######
+def mac_category_case_builder(call_stats_ac_expr, call_stats_af_expr, min_maf_common_variants: float = 0.01):
+    return (
+        hl.case()
+        .when(call_stats_ac_expr <= 5, call_stats_ac_expr)
+        .when(call_stats_ac_expr <= 10, 10)
+        .when(call_stats_ac_expr <= 20, 20)
+        .when(call_stats_af_expr <= 0.001, 0.001)
+        .when(call_stats_af_expr <= min_maf_common_variants, min_maf_common_variants)
+        .default(0.99)
+    )
+
 def filter_ht_for_grm(
-    ht: hl.Table,
+    ht: hl.Table, # VAT format
     pop: str,
-    n_variants_to_keep: int,
+    n_common_variants_to_keep: int=150000, # NOTE: to ensure sufficient number of variants for GRM
     min_call_rate: float = 0.95,
-    min_maf: float = 0.01,
+    min_maf_common_variants: float = 0.01,
+    variants_per_mac_category: int = 2000,
+    variants_per_maf_category: int = 10000,
 ):
     ht = ht.filter(
         (ht.locus.in_autosome())
@@ -39,16 +52,55 @@ def filter_ht_for_grm(
         & (ht.values[f"gvs_{pop}_ac"][0] > 0)
     )
 
-    sampled_variants = ht.aggregate(
-        hl.agg.filter(
-            ht.values[f"gvs_{pop}_af"][0] > min_maf,
-            hl.agg._reservoir_sample(ht.key, n_variants_to_keep),
-        )
+    ht = ht.annotate(
+        mac_category=mac_category_case_builder(ht.values[f"gvs_{pop}_ac"][0], ht.values[f"gvs_{pop}_af"][0], min_maf_common_variants)
     )
 
-    variants = [variant for variant in sampled_variants]
-    print(f"N variants sampled: {len(variants)}")
-    ht = hl.Table.parallelize(variants).key_by(*ht.key.keys())
+    # From: https://hail.zulipchat.com/#narrow/stream/123010-Hail-Query-0.2E2-support/topic/.E2.9C.94.20randomly.20sample.20table/near/388162012
+    bins = ht.aggregate(hl.agg.collect_as_set(ht.mac_category))
+    ac_bins = [bin for bin in bins if (bin >= 1) and (bin<=5)]
+    af_bins = [bin for bin in bins if (bin < 0.99) or (bin > 5)]
+
+    sampled_common_variants = ht.aggregate(
+        hl.agg.filter(
+                ht.values[f"gvs_{pop}_af"][0] > min_maf_common_variants,
+                hl.agg._reservoir_sample(ht.key, n_common_variants_to_keep),
+            ),
+    )
+    print('Finished sampling common variants...')
+    common_variants = [variant for variant in sampled_common_variants]
+
+    binned_variants_af = ht.aggregate(
+        hl.agg.array_agg(
+            lambda x: hl.agg.filter(
+                ht.mac_category == x,
+                hl.agg._reservoir_sample(ht.key, variants_per_maf_category),
+            ),
+            hl.literal(af_bins),
+        ),
+    )
+    print('Finished sampling rare variants...')
+
+    binned_variants_ac = ht.aggregate(
+        hl.agg.array_agg(
+            lambda x: hl.agg.filter(
+                ht.mac_category == x,
+                hl.agg._reservoir_sample(ht.key, variants_per_mac_category),
+            ),
+            hl.literal(ac_bins),
+        )
+    )
+    print('Finished sampling ultra-rare variants...')
+
+    binned_rare_variants = binned_variants_ac + binned_variants_af
+    rare_variants = [variant for bin in binned_rare_variants for variant in bin]
+
+    print(f"N rare variants sampled: {len(rare_variants)}")
+    print(f"N common variants sampled: {len(common_variants)}")
+    rare_ht = hl.Table.parallelize(rare_variants).key_by(*ht.key.keys())
+    common_ht = hl.Table.parallelize(common_variants).key_by(*ht.key.keys())
+    ht = rare_ht.union(common_ht)
+    ht.describe()
 
     return ht
 
@@ -96,133 +148,126 @@ def create_sparse_grm(
 
 
 def main(args):
+    app_name = None
+    if args.create_plink_file:
+        app_name = f"create_plink_file_{args.pop.replace(',', '_')}"
+    if args.test:
+        app_name = f"run_test"
+    print(app_name)
+
     hl.init(
+        app_name=f'Creating_plink_{args.pop.replace(",", "_")}',
+        # app_name='Sample_QC_on_MT',
+        tmp_dir=TMP_BUCKET,
         driver_memory="highmem",
         driver_cores=8,
         worker_memory="highmem",
         worker_cores=1,
         default_reference="GRCh38",
-        log="/pre_process_random_pheno.log",
+        log="/pre_process_saige_data.log"
     )
 
     pops = args.pop.split(",")
     ###############
     # Test chunk
     if args.test:
-        print(pops[0])
-        ht = hl.read_table(get_aou_util_path(name="vat"))
-        ht = ht.collect_by_key()
-        filtered_ht = filter_ht_for_grm(
-            ht, pop=pops[0], min_call_rate=0.9, n_variants_to_keep=N_SAMPLES[pops[0]]
-        )
-        filtered_ht.describe()
+        mt = hl.read_matrix_table(EXOME_MT_PATH)
+        mt.filters.show()
+        # print(hl.len(mt.filters).summarize())
+        # - <expr> (int32):
+        #   Non-missing: 34807589 (100.00%)
+        #       Missing: 0
+        #       Minimum: 0
+        #       Maximum: 0
+        #          Mean: 0.00
+        #       Std Dev: 0.00
     ###############
     for pop in pops:
         if args.create_plink_file:
-            if (
-                not hl.hadoop_exists(
-                    get_aou_sites_for_grm_path(pop=pop, extension="ht")
-                )
-                # or args.overwrite # only needed when the final markers keeped for GRM is not enough
+            if (not hl.hadoop_exists(get_aou_sites_for_grm_path(pop=pop, extension="ht"))
+                or args.overwrite_variant_ht
             ):
-                print(
-                    f"-------------Exporting downsampled variant HT (pop: {pop})-----------"
-                )
-                n_variants_to_keep = 150000
+                print(f"-------------Exporting downsampled variant HT (pop: {pop})-----------")
+                print(f'Min call rate for {pop.upper()}: {MIN_CALL_RATE[pop]}')
                 ht = hl.read_table(get_aou_util_path(name="vat"))
                 ht = ht.collect_by_key()
                 filtered_ht = filter_ht_for_grm(
                     ht,
                     pop=pop,
-                    min_call_rate=MIN_CALL_RATE[pop],
-                    n_variants_to_keep=n_variants_to_keep,
+                    n_common_variants_to_keep= 150000,
+                    min_call_rate= MIN_CALL_RATE[pop],
                 )
-                # Note:
-                # 1) It is ideal to have N_variant == N_sample when building GRM
-                # 2) It is sufficient to use just variants with MAF >= 0.01
+
                 filtered_ht.naive_coalesce(1000).checkpoint(
                     get_aou_sites_for_grm_path(pop=pop, extension="ht"),
-                    _read_if_exists=not args.overwrite,
-                    overwrite=args.overwrite,
+                    _read_if_exists=not args.overwrite_variant_ht,
+                    overwrite=args.overwrite_variant_ht,
                 )
-            if (
-                not hl.hadoop_exists(
-                    get_aou_sites_for_grm_path(pop=pop, extension="mt")
-                )
-                # or args.overwrite
+            filtered_ht = hl.read_table(get_aou_sites_for_grm_path(pop=pop, extension="ht"))
+            print(f'Number of variants sampled for {pop}: {filtered_ht.count()}')
+            if (not hl.hadoop_exists(get_aou_sites_for_grm_path(pop=pop, extension="mt"))
+                or args.overwrite_variant_mt
             ):
-                filtered_ht = hl.read_table(
-                    get_aou_sites_for_grm_path(pop=pop, extension="ht")
-                )
+                filtered_ht = hl.read_table(get_aou_sites_for_grm_path(pop=pop, extension="ht"))
 
                 print(
                     f"-------------Exporting downsampled variant MT (pop: {pop})-----------"
                 )
-                pop_ht = hl.read_table(
-                    get_aou_util_path(name="ancestry_preds", parsed=True)
-                )
-                mt = hl.read_matrix_table(EXOME_MT_PATH)  # (34807589, 245394)
+                mt = get_filtered_mt(analysis_type='gene', filter_samples=False, filter_variants=True, adj_filter=True, pop=pop)
+                meta_ht = hl.read_table(get_sample_meta_path(annotation=True))
+                meta_ht = meta_ht.filter(~meta_ht.related_0th_degree)
+                mt = mt.filter_cols(hl.is_defined(meta_ht[mt.col_key]))
                 mt = mt.filter_rows(hl.is_defined(filtered_ht[mt.row_key]))
 
-                duplicated_samples = hl.read_table(
-                    get_aou_relatedness_path(extension="1st_degrees.ht")
+                print("Removing HLA...")
+                # Common inversion taken from Table S4 of https://www.ncbi.nlm.nih.gov/pubmed/27472961
+                # (converted to GRCh38 by: https://liftover.broadinstitute.org/#input=chr8%3A8055789-11980649&hg=hg19-to-hg38 )
+                # Also removing HLA, from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38
+                mt = mt.filter_rows(
+                    ~hl.parse_locus_interval(
+                        "chr8:8198267-12123140", reference_genome="GRCh38"
+                    ).contains(mt.locus)
+                    & ~hl.parse_locus_interval(
+                        "chr6:28510120-33480577", reference_genome="GRCh38"
+                    ).contains(mt.locus)
                 )
-                print(
-                    f"-------------Removing {duplicated_samples.count()} potentially duplicated samples-----------"
-                )
-                mt = mt.filter_cols(hl.is_missing(duplicated_samples[mt.col_key]))
 
-                if pop != "all":
-                    pop_ht = pop_ht.filter(pop_ht.ancestry_pred == pop)
-                    print(f"N samples kept: {pop_ht.count()}")
-                    mt = mt.filter_cols(hl.is_defined(pop_ht[mt.s]))
-                mt = mt.annotate_rows(call_stats=hl.agg.call_stats(mt.GT, mt.alleles))
-                mt.describe()
-
-                mt = mt.naive_coalesce(1000).checkpoint(
+                mt.naive_coalesce(1000).checkpoint(
                     get_aou_sites_for_grm_path(pop=pop, extension="mt"),
-                    _read_if_exists=not args.overwrite,
-                    overwrite=args.overwrite,
+                    _read_if_exists=not args.overwrite_variant_mt,
+                    overwrite=args.overwrite_variant_mt,
                 )
+                mt = hl.read_matrix_table(get_aou_sites_for_grm_path(pop=pop, extension="mt"))
+                mt.describe()
+                print(mt.count())
 
             if args.ld_prune:
-                mt = hl.read_matrix_table(
-                    get_aou_sites_for_grm_path(pop=pop, extension="mt")
-                )
-
+                mt = hl.read_matrix_table(get_aou_sites_for_grm_path(pop=pop, extension="mt"))
                 mt = mt.unfilter_entries()
-                if (
-                    not hl.hadoop_exists(
-                        get_aou_sites_for_grm_path(pop=pop, extension="ht", pruned=True)
-                    )
-                ) or args.overwrite:
-                    print(
-                        f"-------------Exporting the LD pruned downsampled variant HT (pop: {pop})-----------"
-                    )
-                    ht = hl.ld_prune(mt.GT, r2=0.1)
+                if (not hl.hadoop_exists(get_aou_sites_for_grm_path(pop=pop, extension="ht", pruned=args.ld_prune))
+                    or args.overwrite_ld_ht
+                ):
+                    print(f"-------------Exporting the LD pruned downsampled variant HT (pop: {pop})-----------")
+                    ht = hl.ld_prune(mt.GT,
+                                     r2=0.1,
+                                     bp_window_size=1e7,
+                                     block_size=1024,
+                                     )
                     ht.checkpoint(
-                        get_aou_sites_for_grm_path(
-                            pop=pop, extension="ht", pruned=True
-                        ),
-                        _read_if_exists=not args.overwrite,
-                        overwrite=args.overwrite,
+                        get_aou_sites_for_grm_path(pop=pop, extension="ht", pruned=args.ld_prune),
+                        _read_if_exists=not args.overwrite_ld_ht,
+                        overwrite=args.overwrite_ld_ht,
                     )
-                ht = hl.read_table(
-                    get_aou_sites_for_grm_path(pop=pop, extension="ht", pruned=True)
-                )
+                ht = hl.read_table(get_aou_sites_for_grm_path(pop=pop, extension="ht", pruned=args.ld_prune))
                 mt = mt.filter_rows(hl.is_defined(ht[mt.row_key]))
 
-            if args.overwrite or not hl.hadoop_exists(
-                f'{get_aou_sites_for_grm_path(pop = pop, extension="bed", pruned=args.ld_prune)}'
+            if args.overwrite_plink or not hl.hadoop_exists(
+                f'{get_aou_sites_for_grm_path(pop = pop, extension="plink.bed", pruned=True)}'
             ):
-                print(
-                    f"-------------Exporting variant downsampled plink files (pop: {pop})-----------"
-                )
+                print(f"-------------Exporting variant downsampled plink files (pop: {pop})-----------")
                 hl.export_plink(
                     mt,
-                    get_aou_sites_for_grm_path(
-                        pop=pop, extension="plink", pruned=args.ld_prune
-                    ),
+                    get_aou_sites_for_grm_path(pop=pop, extension="plink", pruned=args.ld_prune),
                 )
 
         if args.create_sparse_grm:
@@ -262,6 +307,18 @@ if __name__ == "__main__":
         "--create-plink-file", help="Create plink files for GRM", action="store_true"
     )
     parser.add_argument(
+        "--overwrite-variant-ht", help="Resample variants for GRM and plink files", action="store_true"
+    )
+    parser.add_argument(
+        "--overwrite-variant-mt", help="Overwrite the MT filtered to selected variants and samples for GRM and plink files", action="store_true"
+    )
+    parser.add_argument(
+        "--overwrite-ld-ht", help="Overwrite LD-pruned variant HT", action="store_true"
+    )
+    parser.add_argument(
+        "--overwrite-plink", help="Overwrite plink files", action="store_true"
+    )
+    parser.add_argument(
         "--create-sparse-grm", help="Create the sparse grm", action="store_true"
     )
     parser.add_argument(
@@ -270,7 +327,7 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
-        "--pop", help="Comma-separated list of pops to run", default="all"
+        "--pop", help="Comma-separated list of pops to run", default='afr,amr,eas,eur,mid,sas'
     )
     parser.add_argument(
         "--overwrite",
