@@ -18,6 +18,244 @@ import time
 from utils.utils import *  # for QoB
 from utils.resources import *  # for QoB
 
+################################################ Remove after docker image is built ################################################
+# ALL PATHs in the workbech: https://support.researchallofus.org/hc/en-us/articles/4616869437204-Controlled-CDR-Directory
+# Descriptions: https://support.researchallofus.org/hc/en-us/articles/4614687617556-How-the-All-of-Us-Genomic-data-are-organized
+import hail as hl
+
+##################### ROOT PATHs #####################
+TRANCHE = "250k"
+BUCKET = "gs://aou_analysis"
+MY_BUCKET = "gs://aou_wlu"
+TMP_BUCKET = "gs://aou_tmp"
+CURRENT_PATH = f"{BUCKET}/{TRANCHE}"
+DATA_PATH = f"{CURRENT_PATH}/data"
+
+##################### PARAMETERs #####################
+GWAS_AF_CUTOFF = 0.001  # above
+RVAS_AF_CUTOFF = 0.001  # below
+CALLRATE_CUTOFF = 0.8
+N_GENE_PER_GROUP = 10
+MIN_CALL_RATE = {
+    "all": 0.95,
+    "afr": 0.9,
+    "amr": 0.85,
+    "eas": 0.9,
+    "eur": 0.95,
+    "mid": 0,
+    "sas": 0.7,
+}
+SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.3.0"
+PILOT_PHENOTYPES = set(["height", "250.2", "411", "495", "585.3"])
+
+##################### POPULATION SUMMARY (Computed in the AoU workbench):
+# ANCESTRY_PATH = 'gs://fc-aou-datasets-controlled/v7/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv'
+# pop_ht = hl.import_table(ANCESTRY_PATH, key="research_id", impute=True,
+#                              types={"research_id": "tstr", "pca_features": hl.tarray(hl.tfloat)})
+# pop_ht.aggregate(hl.agg.counter(pop_ht.ancestry_pred))
+POPS = ("afr", "amr", "eas", "eur", "mid", "sas")
+N_SAMPLES = {
+    "all": 245394,
+    "afr": 56913,
+    "amr": 45035,
+    "eas": 5706,
+    "eur": 133581,
+    "mid": 942,
+    "sas": 3217,
+}
+
+##################### ORIGINAL PATHs #####################
+ORIGINAL_GENO_ROOT = "gs://prod-drc-broad"
+ORIGINAL_PHENO_ROOT = "gs://allxall-phenotypes/data"
+
+ORIGINAL_PHENO_PATHs = [
+    f"{ORIGINAL_PHENO_ROOT}/top_10_labs.csv",
+    f"{ORIGINAL_PHENO_ROOT}/demographics_table.csv",
+    f"{ORIGINAL_PHENO_ROOT}/physical_measurement_table.csv",
+    f"{ORIGINAL_PHENO_ROOT}/r_drug_table.csv",
+    f"{ORIGINAL_PHENO_ROOT}/pfhh_survey_table.csv",
+    f"{ORIGINAL_PHENO_ROOT}/mcc2_phecode_table.csv",
+]
+TRAIT_TYPEs = ["physical_measurement", "r_drug", "pfhh_survey", "mcc2_phecode"]
+
+ORIGINAL_CALLSET_PATH = f"{ORIGINAL_GENO_ROOT}/aou-wgs-delta-small_callsets_gq0/v7.1"
+ACAF_MT_PATH = f"{ORIGINAL_CALLSET_PATH}/acaf_threshold_v7.1/splitMT/delta_basis_without_ext_aian_prod_gq0_3regions.acaf_threshold.split.mt"
+EXOME_MT_PATH = f"{ORIGINAL_CALLSET_PATH}/exome_v7.1/splitMT/delta_basis_without_ext_aian_prod_gq0_3regions.exome.split.mt" # (34807589, 245394)
+VDS_PATH = f"{ORIGINAL_GENO_ROOT}/v7/wgs/without_ext_aian_prod/vds/aou_srwgs_short_variants_v7_without_ext_aian_prod.vds"
+
+ORIGINAL_UTIL_PATH = f"{ORIGINAL_GENO_ROOT}/aou-wgs-delta-aux_gq0"
+ORIGINAL_POP_PATH = (
+    f"{ORIGINAL_UTIL_PATH}/ancestry/delta_v1_gt_no_ext_aian_gq0_prod.ancestry_preds.tsv"
+)
+ORIGINAL_RELATED_INFO_PATH = (
+    f"{ORIGINAL_UTIL_PATH}/relatedness/delta_v1_gt_no_ext_aian_gq0_prod.relatedness.tsv"
+)
+ORIGINAL_RELATED_SAMPLE_PATH = f"{ORIGINAL_UTIL_PATH}/relatedness/delta_v1_gt_no_ext_aian_gq0_prod.relatedness_flagged_samples.tsv"
+SAMPLE_INFO_PATHs = [
+    ORIGINAL_POP_PATH,
+    ORIGINAL_RELATED_INFO_PATH,
+    ORIGINAL_RELATED_SAMPLE_PATH,
+]
+table_keys = {
+    "ancestry_preds": ["research_id"],
+    "relatedness": ["i.s", "j.s"],
+    "relatedness_flagged_samples": ["sample_id"],
+}
+
+
+##################### PHENOTYPE & SAMPLE PATHs #####################
+def get_raw_phenotype_path(
+    name: str, parsed: bool = True, extension: str = "ht", tranche: str = TRANCHE
+):
+    assert name in [
+        "r_drug_table",
+        "pfhh_survey_table",
+        "mcc2_phecode_table",
+        "demographics_table",
+        "physical_measurement_table",
+        "top_10_labs",
+    ], 'Name has to be from ["r_drug_table", "pfhh_survey_table", "mcc2_phecode_table", "demographics_table", "physical_measurement_table", "top_10_labs"]'
+    return (
+        f'{DATA_PATH}/phenotype/{"" if parsed else "raw/"}{name}_{tranche}.{extension}'
+    )
+
+
+def get_random_phenotype_path(pop: str, extension: str = "tsv", test: bool = False):
+    return f'{DATA_PATH}/phenotype/random_phenos/random_pheno_{pop}{"_test" if test else ""}.{extension}'
+
+
+BINARY_HT_PATHs = [
+    get_raw_phenotype_path(name="r_drug_table", parsed=True),
+    get_raw_phenotype_path(name="pfhh_survey_table", parsed=True),
+    get_raw_phenotype_path(name="mcc2_phecode_table", parsed=True),
+]
+DEMOGRAPHICS_HT_PATH = get_raw_phenotype_path(name="demographics_table", parsed=True)
+QUANTITATIVE_HT_PATH = get_raw_phenotype_path(
+    name="physical_measurement_table", parsed=True
+)
+
+
+def get_full_phenotype_path(
+    annotation: bool,
+    random_pheno: bool = False,
+    extension: str = "ht",
+    tranche: str = TRANCHE,
+):
+    return f'{DATA_PATH}/phenotype/aou_all{"_random" if random_pheno else ""}_phenotypes{"_annotated" if annotation else ""}_{tranche}.{extension}'
+
+
+def get_sample_meta_path(
+    annotation: bool, extension: str = "ht", tranche: str = TRANCHE
+):
+    return f'{DATA_PATH}/utils/aou_sample_meta_info{"_annotated" if annotation else ""}_{tranche}.{extension}'
+
+
+def get_aou_util_path(
+    name: str, parsed: bool = False, extension: str = "ht", tranche: str = TRANCHE
+):
+    assert name in [
+        "ancestry_preds",
+        "relatedness",
+        "relatedness_flagged_samples",
+        "vat",
+        "mt_sample_qc",
+        "acaf_mt_sample_qc",
+        "vds_sample_qc",
+        "sample_qc",
+        "variant_qc"
+        "sample_qc_tmp",
+        "vep_corrected",
+        "vep_old",
+    ], 'Name has to be from ["ancestry_preds", "relatedness", "relatedness_flagged_samples", "vat", "mt_sample_qc", "vds_sample_qc","sample_qc", "variant_qc", "sample_qc_tmp", "vep_corrected", "vep_old"]'
+    tag1 = (name == "ancestry_preds") and parsed
+    tag2 = (name == "gene_map") and parsed
+    if name == "vat":
+        # gsutil -m cp -r gs://aou_wlu/utils/vat/hail_0_2_107/aou_PARSED_SORTED_vat.ht gs://aou_analysis/250k/data/utils/aou_parsed_and_sorted_vat_hail_0_2_107_250k.ht
+        name = "parsed_and_sorted_vat_hail_0_2_107"
+    return f'{DATA_PATH}/utils/aou_{name}{"_parsed" if tag1 else ""}{"_processed" if tag2 else ""}_{tranche}.{extension}'
+
+
+def get_aou_relatedness_path(extension: str = "ht", tranche: str = TRANCHE):
+    return f"{DATA_PATH}/utils/aou_ibd_relatedness_{tranche}.{extension}"
+
+def get_aou_gene_map_ht_path(pop: str, processed=False, tranche: str = TRANCHE):
+    return f"{DATA_PATH}/utils/gene_map/aou_{pop}_gene_map{'_processed' if processed else ''}_{tranche}.ht"
+
+
+##################### Random Phenotype GRM PATHs #####################
+def get_aou_sites_for_grm_path(
+    pop: str, extension: str, pruned: bool = False, tranche: str = TRANCHE
+):
+    return f'{DATA_PATH}/utils/grm/aou_{pop}_sites{"_pruned" if pruned else ""}_for_grm_{tranche}.{extension}'
+
+def get_aou_sample_file_path(
+    pop: str, tranche: str = TRANCHE
+):
+    return f'{DATA_PATH}/utils/grm/aou_{pop}_{tranche}.samples'
+
+
+
+##################### Result PATHs #####################
+
+GENE_INTERVAL_PATH = (
+    f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
+)
+
+VARIANT_INTERVAL_PATH = f"gs://aou_wlu/data/variant_intervals.ht"
+
+
+def get_aou_saige_results_root(analysis_type: str, pop: str, name: str, test: bool = False):
+    assert analysis_type in [
+        "gene",
+        "variant",
+    ], "Name has to be from ['gene', 'variant']"
+    assert name in [
+        "bgen",
+        "result",
+    ], "Name has to be from ['bgen', 'result']"
+    return f'{CURRENT_PATH}/{analysis_type}_results/{name}/{"test" if test else pop.upper()}'
+
+
+def get_aou_saige_utils_root(pop: str, name: str, random_pheno: bool = False):
+    assert name in [
+        "pheno_file",
+        "null_glmm",
+    ], "Name has to be from ['pheno_file', 'null_glmm']"
+    return f"{CURRENT_PATH}/{name}/{pop.upper()}{'/random_pheno' if random_pheno else ''}"
+
+#################
+def get_filtered_mt(analysis_type: str, pop: str, filter_samples: bool=True, filter_variants: bool=True, adj_filter: bool=True):
+    from gnomad.utils.annotations import annotate_adj
+    mt_path = EXOME_MT_PATH if analysis_type=='gene' else ACAF_MT_PATH
+    mt = hl.read_matrix_table(mt_path)
+    meta_ht = hl.read_table(get_sample_meta_path(annotation=True))
+    mt = mt.annotate_cols(**meta_ht[mt.col_key])
+    mt = mt.filter_entries(mt.FT != 'FAIL') # TODO: if using VDS, that's a bool
+    # print(mt.aggregate_entries(hl.agg.counter(mt.FT)))
+    # {'FAIL': 2323118301, 'PASS': 63243269454, None: 8308706765322}
+    if pop is not None:
+        mt = mt.filter_cols(mt.pop==pop)
+    if filter_variants:
+        mt = mt.filter_rows(
+            (hl.len(mt.filters) == 0) & # TODO: update this with the VDS filters
+            (mt.info.AC[0] > 0)
+        )
+    if filter_samples:
+        mt = mt.filter_cols(mt.samples_to_keep)
+    if adj_filter:
+        """
+        Filter genotypes to adj criteria - Default: 
+        GQ >= 20, haploid_DP >= 5, else_DP >= 10, 
+        het_ref_altAB >= 0.2, het_non_ref_altAB >= 0.2 , het_non_ref_refAB > =0.2
+        """
+        mt= mt.annotate_entries(DP=hl.sum(mt.AD))
+        mt = annotate_adj(mt)
+        mt = mt.filter_entries(mt.adj)
+        mt = mt.filter_rows(hl.agg.any(mt.GT.n_alt_alleles() >0))
+    return mt
+
+
+################################################ Remove after docker image is built ################################################
 
 logging.basicConfig(
     format="%(levelname)s (%(name)s %(lineno)s): %(message)s",
@@ -45,6 +283,7 @@ def run_saige(
     samples_file: ResourceGroup,
     docker_image: str,
     group_file: str = None,
+    groups: str=None,
     trait_type: str = "continuous",
     chrom: str = "chr1",
     min_mac: int = 1,
@@ -102,7 +341,7 @@ def run_saige(
     command = (
         f"set -o pipefail; {MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R "
         f"--bgenFile={bgen_file.bgen} " 
-        f'--bgenFileIndex={bgen_file["bgen.bgi"]} '
+        f'--bgenFileIndex={bgen_file["bgen.idx2"]} '
         f"--chrom={chrom} " 
         f"--minMAF={min_maf} " 
         f"--minMAC={min_mac} " 
@@ -126,6 +365,7 @@ def run_saige(
             )
         command += (
             f"--groupFile={group_file} " 
+            f"--annotation_in_groupTest={groups}"
             f"--is_output_markerList_in_groupTest=TRUE "
             f"--is_single_in_groupTest=TRUE "
             f"--IsOutputBETASEinBurdenTest=TRUE " #
@@ -290,37 +530,38 @@ def export_bgen_from_mt(
     output_dir,
     mean_impute_missing,
     no_adj: bool=False,
-    variant_af_filter: float = 0.001,
     variant_ac_filter: int = 0,
     variant_callrate_filter: float=0,
+    index_only: bool=False
 ):
-    mt = get_filtered_mt(analysis_type=analysis_type, filter_variants=True, filter_samples=True, adj_filter= not no_adj, pop=pop)
-
     outname = f"{analysis_type}_{chromosome}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+    if not index_only:
+        mt = get_filtered_mt(analysis_type=analysis_type, filter_variants=True, filter_samples=True, adj_filter= not no_adj, pop=pop)
 
-    # Filter to interval
-    mt = hl.filter_intervals(mt, [interval])
+        # Filter to interval
+        mt = hl.filter_intervals(mt, [interval])
 
-    mt = mt.select_entries("GT")
-    mt = mt.filter_rows(
-        hl.agg.count_where(mt.GT.is_non_ref()) > 0
-    )  # Filter to non-reference sites
-    mt = mt.annotate_rows(
-        rsid=mt.locus.contig + ":" + hl.str(mt.locus.position) + "_" + mt.alleles[0] + "/" + mt.alleles[1]
-    )  # Annotate rsid
+        mt = mt.select_entries("GT")
+        mt = mt.filter_rows(
+            hl.agg.count_where(mt.GT.is_non_ref()) > 0
+        )  # Filter to non-reference sites
+        mt = mt.annotate_rows(
+            rsid=mt.locus.contig + ":" + hl.str(mt.locus.position) + "_" + mt.alleles[0] + "/" + mt.alleles[1]
+        )  # Annotate rsid
 
-    if variant_ac_filter:
-        mt = mt.filter_rows(mt.info.AC[0] > variant_ac_filter)
+        if variant_ac_filter:
+            mt = mt.filter_rows(mt.info.AC[0] > variant_ac_filter)
 
-    if variant_callrate_filter:
-        mt = mt.filter_rows(mt.info.AN/(2*N_SAMPLES[pop]) > variant_callrate_filter)
+        if variant_callrate_filter:
+            mt = mt.filter_rows(mt.info.AN/(2*N_SAMPLES[pop]) > variant_callrate_filter)
 
-    mt = mt.annotate_entries(
-        GT=hl.if_else(mt.GT.is_haploid(), hl.call(mt.GT[0], mt.GT[0]), mt.GT)
-    )
-    mt = gt_to_gp(mt)
-    mt = impute_missing_gp(mt, mean_impute=mean_impute_missing)
-    hl.export_bgen(mt, f"{output_dir}/{outname}", gp=mt.GP, varid=mt.rsid)
+        mt = mt.annotate_entries(
+            GT=hl.if_else(mt.GT.is_haploid(), hl.call(mt.GT[0], mt.GT[0]), mt.GT)
+        )
+        mt = gt_to_gp(mt)
+        mt = impute_missing_gp(mt, mean_impute=mean_impute_missing)
+        hl.export_bgen(mt, f"{output_dir}/{outname}", gp=mt.GP, varid=mt.rsid)
+    hl.index_bgen(path=f"{output_dir}/{outname}.bgen", index_file_map={f"{output_dir}/{outname}.bgen":f"{output_dir}/{outname}.bgen.idx2"}, reference_genome='GRCh38')
 
 
 def export_gene_group_file(interval, groups, pop, output_dir):
@@ -363,27 +604,28 @@ def main(args):
     chrom_lengths = hl.get_reference(reference).lengths
     pops = args.pops.split(",") if args.pops else POPS
 
-    pheno_ht = hl.read_table(get_full_phenotype_path(annotation=True, random_pheno=args.random_pheno))
-    pheno_ht = pheno_ht.filter(pheno_ht.samples_to_keep)
 
     if args.pilot or (args.phenos is not None):
         phenos_to_run = PILOT_PHENOTYPES if args.pilot else args.phenos.split(",")
-        quantitative_phenos = hl.eval(pheno_ht.trait_type)["continuous"]
-    elif args.random_pheno:
-        raw_random_pheno_ht = hl.import_table(
-            get_random_phenotype_path(pop=pops[0], test=True),
-            key="userId",
-            impute=True,
-            types={"userId": hl.tstr},
-        )
-        phenos_to_run = list(raw_random_pheno_ht.row_value)
-        quantitative_phenos = [pheno for pheno in phenos_to_run if 'continuous' in pheno ]
+        quantitative_phenos = ['height']
     else:
-        raw_pheno_ht = hl.read_table(
-            get_full_phenotype_path(annotation=False, random_pheno=args.random_pheno)
-        )
-        phenos_to_run = list(raw_pheno_ht.row_value)
-        quantitative_phenos = hl.eval(pheno_ht.trait_type)["continuous"]
+        pheno_ht = hl.read_table(get_full_phenotype_path(annotation=True, random_pheno=args.random_pheno))
+        pheno_ht = pheno_ht.filter(pheno_ht.samples_to_keep)
+        if args.random_pheno:
+            raw_random_pheno_ht = hl.import_table(
+                get_random_phenotype_path(pop=pops[0], test=True),
+                key="userId",
+                impute=True,
+                types={"userId": hl.tstr},
+            )
+            phenos_to_run = list(raw_random_pheno_ht.row_value)
+            quantitative_phenos = [pheno for pheno in phenos_to_run if 'continuous' in pheno ]
+        else:
+            raw_pheno_ht = hl.read_table(
+                get_full_phenotype_path(annotation=False, random_pheno=args.random_pheno)
+            )
+            phenos_to_run = list(raw_pheno_ht.row_value)
+            quantitative_phenos = hl.eval(pheno_ht.trait_type)["continuous"]
         # TODO: create phenotype info table and add phenotype filters (min cases, etc)
 
     print(f"Got {len(phenos_to_run)} phenotypes...")
@@ -481,9 +723,11 @@ def main(args):
             billing_project="all-by-aou", remote_tmpdir=TMP_BUCKET
         )
         print(f"Docker image: {SAIGE_DOCKER_IMAGE}...")
+
+        chromosome = f"chr{args.chrom}"
         for pop in pops:
             b = hb.Batch(
-                name=f"saige_aou_{pop}",
+                name=f"saige_aou_{pop}_{chromosome}",
                 backend=backend,
                 default_image=SAIGE_DOCKER_IMAGE,
                 default_storage="500Mi",
@@ -563,74 +807,73 @@ def main(args):
             bgens_already_created = {}
             if not overwrite_bgens and hl.hadoop_exists(bgen_dir):
                 bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir)}
-            print(f'Found {int(len(bgens_already_created)/2)} Bgens in directory...')
+            print(f'Found {int(len(bgens_already_created)/4)} Bgens in directory...')
 
             bgens = {}
-            for chrom in chromosomes:
-                chromosome = f"chr{chrom}"
-                sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
-                intervals = sub_interval_ht.aggregate(
-                    hl.agg.collect(sub_interval_ht.interval)
+            sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
+            intervals = sub_interval_ht.aggregate(
+                hl.agg.collect(sub_interval_ht.interval)
+            )
+            if args.hail_image is None:
+                image = hb.build_python_image(
+                    "us-central1-docker.pkg.dev/aou-neale-gwas/hail-batch/hail_gnomad_python_3.9",
+                    requirements=["hail", "gnomad"],
+                    python_version="3.9",
                 )
-                for interval in intervals:
-                    bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
-                    if f"{bgen_root}.bgen" not in bgens_already_created:
-                        bgen_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{interval}_bgen"
-                        )
-                        if args.hail_image is None:
-                            image = hb.build_python_image(
-                                "us-central1-docker.pkg.dev/aou-neale-gwas/hail-batch/hail_gnomad_python_3.9",
-                                requirements=["hail", "gnomad"],
-                                python_version="3.9",
-                            )
-                        else:
-                            image = args.hail_image
-                        bgen_task.image(image)
-                        bgen_task.call(
-                            export_bgen_from_mt,
-                            pop=pop,
-                            chromosome=chromosome,
-                            analysis_type=analysis_type,
-                            interval=interval,
-                            output_dir=bgen_dir,
-                            mean_impute_missing=args.mean_impute_missing,
-                            no_adj=args.no_adj,
-                            variant_ac_filter= 0,
-                            variant_callrate_filter=0
-                        )
-                        bgen_task.attributes["pop"] = pop
-                        bgen_task.attributes["chromosome"] = chromosome
-                        bgen_task.attributes["analysis_type"] = analysis_type
-                    if (f"{bgen_root}.gene.txt" not in bgens_already_created) and analysis_type=='gene':
-                        gene_txt_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{hl.eval(hl.str(interval))}_gene_txt"
-                        )
-                        gene_txt_task.image(HAIL_DOCKER_IMAGE)
-                        gene_txt_task.call(
-                            export_gene_group_file,
-                            interval=interval,
-                            groups=groups,
-                            pop=pop,
-                            output_dir=f"{bgen_root}.gene.txt",
-                        )
-                        gene_txt_task.attributes["pop"] = pop
-                        gene_txt_task.attributes["chromosome"] = chromosome
-
-                    bgen_file = b.read_input_group(
-                        **{
-                            "bgen": f"{bgen_root}.bgen",
-                            "bgen.bgi": f"{bgen_root}.bgen.bgi",
-                            "sample": f"{bgen_root}.sample",
-                        }
+            else:
+                image = args.hail_image
+                
+            for interval in intervals:
+                bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+                if (f"{bgen_root}.bgen" not in bgens_already_created) or args.index_only:
+                    bgen_task = b.new_python_job(
+                        name=f"{analysis_type}_analysis_export_{interval}_bgen"
                     )
-                    if analysis_type == 'gene':
-                        group_file = b.read_input(f"{bgen_root}.gene.txt")
-                        bgens[hl.eval(hl.str(interval))] = (bgen_file, group_file)
-                    else:
-                        bgens[hl.eval(hl.str(interval))] = bgen_file
-                    if args.test:
-                        break
+
+                    bgen_task.image(image)
+                    bgen_task.call(
+                        export_bgen_from_mt,
+                        pop=pop,
+                        chromosome=chromosome,
+                        analysis_type=analysis_type,
+                        interval=interval,
+                        output_dir=bgen_dir,
+                        mean_impute_missing=args.mean_impute_missing,
+                        no_adj=args.no_adj,
+                        variant_ac_filter= 0,
+                        variant_callrate_filter=0,
+                        index_only=args.index_only
+                    )
+                    bgen_task.attributes["pop"] = pop
+                    bgen_task.attributes["chromosome"] = chromosome
+                    bgen_task.attributes["analysis_type"] = analysis_type
+                if (f"{bgen_root}.gene.txt" not in bgens_already_created) and analysis_type=='gene':
+                    gene_txt_task = b.new_python_job(
+                        name=f"{analysis_type}_analysis_export_{hl.eval(hl.str(interval))}_gene_txt"
+                    )
+                    gene_txt_task.image(HAIL_DOCKER_IMAGE)
+                    gene_txt_task.call(
+                        export_gene_group_file,
+                        interval=interval,
+                        groups=groups,
+                        pop=pop,
+                        output_dir=f"{bgen_root}.gene.txt",
+                    )
+                    gene_txt_task.attributes["pop"] = pop
+                    gene_txt_task.attributes["chromosome"] = chromosome
+
+                bgen_file = b.read_input_group(
+                    **{
+                        "bgen": f"{bgen_root}.bgen",
+                        "bgen.idx2": f"{bgen_root}.bgen.idx2",
+                        "sample": f"{bgen_root}.sample",
+                    }
+                )
+                if analysis_type == 'gene':
+                    group_file = b.read_input(f"{bgen_root}.gene.txt")
+                    bgens[hl.eval(hl.str(interval))] = (bgen_file, group_file)
+                else:
+                    bgens[hl.eval(hl.str(interval))] = bgen_file
                 if args.test:
                     break
 
@@ -660,57 +903,60 @@ def main(args):
                     and hl.hadoop_exists(pheno_results_dir)
                 ):
                     results_already_created = {x["path"] for x in hl.hadoop_ls(pheno_results_dir)}
+                print(f'Found {int(len(results_already_created) / 4)} results in directory...')
 
                 saige_tasks = []
-                for chrom in chromosomes:
-                    chromosome = f"chr{chrom}"
-                    sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
-                    intervals = sub_interval_ht.aggregate(
-                        hl.agg.collect(sub_interval_ht.interval)
-                    )
-                    for interval in intervals:
-                        results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
-                        if analysis_type == "gene":
-                            bgen_file, group_file = bgens[hl.eval(hl.str(interval))]
-                            max_maf_for_group_test = RVAS_AF_CUTOFF
-                        else:
-                            bgen_file = bgens[hl.eval(hl.str(interval))]
-                            group_file = None
-                            max_maf_for_group_test = None
+                sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
+                intervals = sub_interval_ht.aggregate(
+                    hl.agg.collect(sub_interval_ht.interval)
+                )
+                for interval in intervals:
+                    results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
+                    group_file = None
+                    max_maf_for_group_test = None
+                    groups = None
+                    if analysis_type == "gene":
+                        bgen_file, group_file = bgens[hl.eval(hl.str(interval))]
+                        max_maf_for_group_test = 0.001
+                        groups = args.groups
+                    else:
+                        bgen_file = bgens[hl.eval(hl.str(interval))]
 
-                        if (
-                            overwrite_results
-                            or f"{results_path}.single_variant.txt"
-                            not in results_already_created
-                        ):
-                            samples_file = b.read_input(get_aou_sample_file_path(pop=pop))
-                            saige_task = run_saige(
-                                p=b,
-                                output_root=results_path,
-                                model_file=model_file,
-                                variance_ratio_file=variance_ratio_file,
-                                sparse_grm_file=sparse_grm[sparse_grm_extension],
-                                bgen_file=bgen_file,
-                                samples_file=samples_file,
-                                docker_image=SAIGE_DOCKER_IMAGE,
-                                group_file=group_file,
-                                trait_type=trait_type,
-                                chrom=interval.start.contig,
-                                min_mac=1,
-                                min_maf=0,
-                                max_maf_for_group=max_maf_for_group_test,
-                            )
-                            saige_task.attributes.update(
-                                {"interval": hl.eval(hl.str(interval)), "pop": pop, "chromosome":chromosome}
-                            )
-                            saige_task.attributes.update(
-                                {"phenotype": copy.deepcopy(phenoname)}
-                            )
-                            saige_tasks.append(saige_task)
-                        if args.test:
-                            break
+                    if (
+                        overwrite_results
+                        or f"{results_path}.single_variant.txt"
+                        not in results_already_created
+                    ):
+                        samples_file = b.read_input(get_aou_sample_file_path(pop=pop))
+                        saige_task = run_saige(
+                            p=b,
+                            output_root=results_path,
+                            model_file=model_file,
+                            variance_ratio_file=variance_ratio_file,
+                            sparse_grm_file=sparse_grm[sparse_grm_extension],
+                            bgen_file=bgen_file,
+                            samples_file=samples_file,
+                            docker_image=SAIGE_DOCKER_IMAGE,
+                            group_file=group_file,
+                            trait_type=trait_type,
+                            chrom=chromosome,
+                            min_mac=1,
+                            min_maf=0,
+                            max_maf_for_group=max_maf_for_group_test,
+                        )
+                        saige_task.attributes.update(
+                            {"interval": hl.eval(hl.str(interval)), "pop": pop, "chromosome":chromosome}
+                        )
+                        saige_task.attributes.update(
+                            {"phenotype": copy.deepcopy(phenoname)}
+                        )
+                        saige_tasks.append(saige_task)
                     if args.test:
                         break
+                if args.test:
+                    break
+            if args.test:
+                break
             b.run()
         #     res_tasks = []
         #     if (
@@ -823,10 +1069,15 @@ if __name__ == "__main__":
         "(e.g. continuous-50-both_sexes--,icd10-E1.*,brain_mri-.* )",
     )
     parser.add_argument(
+        "--groups",
+        help="Comma-separated list of functional groups used for gene-based test ",
+        default="pLoF,missense|LC,pLoF|missense|LC,synonymous,missense",
+    )
+    parser.add_argument(
         "--pops", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
     )
     parser.add_argument(
-        "--groups", help="comma-separated list of gene groups to run RVAS"
+        "--chrom", help="chromosome to run", default="1"
     )
     parser.add_argument(
         "--pilot", help="Run pilot phenotypes only", action="store_true"
@@ -853,6 +1104,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_adj",
         help="Use all genotypes instead of only high-quality ones",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--index_only",
+        help="Index the bgens without overwriting",
         action="store_true",
     )
     parser.add_argument(
