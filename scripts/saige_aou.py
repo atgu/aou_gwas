@@ -17,6 +17,7 @@ import time
 # from aou_gwas import *  # for dataproc
 from utils.utils import *  # for QoB
 from utils.resources import *  # for QoB
+from utils.results_loading import * # for QoB
 
 ################################################ Remove after docker image is built ################################################
 # ALL PATHs in the workbech: https://support.researchallofus.org/hc/en-us/articles/4616869437204-Controlled-CDR-Directory
@@ -166,7 +167,8 @@ def get_aou_util_path(
         "sample_qc_tmp",
         "vep_corrected",
         "vep_old",
-    ], 'Name has to be from ["ancestry_preds", "relatedness", "relatedness_flagged_samples", "vat", "mt_sample_qc", "vds_sample_qc","sample_qc", "variant_qc", "sample_qc_tmp", "vep_corrected", "vep_old"]'
+        "vep"
+    ], 'Name has to be from ["ancestry_preds", "relatedness", "relatedness_flagged_samples", "vat", "mt_sample_qc", "vds_sample_qc","sample_qc", "variant_qc", "sample_qc_tmp", "vep_corrected", "vep_old", "vep"]'
     tag1 = (name == "ancestry_preds") and parsed
     tag2 = (name == "gene_map") and parsed
     if name == "vat":
@@ -202,7 +204,6 @@ GENE_INTERVAL_PATH = (
 )
 
 VARIANT_INTERVAL_PATH = f"gs://aou_wlu/data/variant_intervals.ht"
-
 
 def get_aou_saige_results_root(analysis_type: str, pop: str, name: str, test: bool = False):
     assert analysis_type in [
@@ -271,7 +272,6 @@ HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.124-py3.9"
 SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.3.0"  # latest
 QQ_DOCKER_IMAGE = "konradjk/saige_qq:0.2"
 
-MKL_OFF = "export MKL_NUM_THREADS=1; export MKL_DYNAMIC=false; export OMP_NUM_THREADS=1; export OMP_DYNAMIC=false; "
 
 def run_saige(
     p: Batch,
@@ -296,7 +296,7 @@ def run_saige(
     """
     Change log:
     use_bgen and log_pvalue are defaults now
-    - Removed --IsOutputlogPforSingle, --sparseSigmaFile
+    - Removed --IsOutputlogPforSingle, --sparseSigmaFile, --IsOutputPvalueNAinGroupTestforBinary, IsOutputBETASEinBurdenTest, IsOutputAFinCaseCtrl
     - Added --sparseGRMFile, --sparseGRMSampleIDFile, --is_fastTest, --is_output_markerList_in_groupTest
     - Changed --maxMAFforGroupTest to --maxMAF_in_groupTest, --IsSingleVarinGroupTest to --is_single_in_groupTest
     :param p:
@@ -319,6 +319,7 @@ def run_saige(
     :param add_suffix:
     :return:
     """
+    MKL_OFF = "export MKL_NUM_THREADS=1; export MKL_DYNAMIC=false; export OMP_NUM_THREADS=1; export OMP_DYNAMIC=false; "
     analysis_type = "gene" if group_file is not None else "variant"
     run_saige_task: Job = (
         p.new_job(name=f"run_saige", attributes={"analysis_type": analysis_type})
@@ -332,7 +333,7 @@ def run_saige(
         run_saige_task.declare_resource_group(
             result={
                 f"{add_suffix}gene.txt": "{root}",
-                f"{add_suffix}single.txt": "{root}_single",
+                f"result.singleAssoc.txt": "{root}.singleAssoc.txt",
             }
         )
     else:
@@ -341,36 +342,32 @@ def run_saige(
     command = (
         f"set -o pipefail; {MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R "
         f"--bgenFile={bgen_file.bgen} " 
-        f'--bgenFileIndex={bgen_file["bgen.idx2"]} '
+        f'--bgenFileIndex={bgen_file["bgen.bgi"]} '
         f"--chrom={chrom} " 
         f"--minMAF={min_maf} " 
         f"--minMAC={min_mac} " 
-        f"--maxMAF_in_groupTest={max_maf_for_group} "
         f"--sampleFile={samples_file} " 
         f"--GMMATmodelFile={model_file} " 
         f"--varianceRatioFile={variance_ratio_file} " 
         f"--sparseGRMFile={sparse_grm_file} "
         f"--sparseGRMSampleIDFile={sparse_grm_file}.sampleIDs.txt " 
-        f"--LOCO=FALSE " 
         f"--AlleleOrder=ref-first " 
         f"--SAIGEOutputFile={run_saige_task.result} "
-        f"--is_fastTest=TRUE"
     )
 
     if analysis_type == "gene":
         if trait_type == "binary":
             command += (
-                f"--IsOutputPvalueNAinGroupTestforBinary=TRUE " #
-                f"--is_output_moreDetails=TRUE"
+                f"--is_output_moreDetails=TRUE "
             )
         command += (
             f"--groupFile={group_file} " 
-            f"--annotation_in_groupTest={groups}"
+            f"--annotation_in_groupTest=plof,synonymous "
             f"--is_output_markerList_in_groupTest=TRUE "
+             f"--maxMAF_in_groupTest={max_maf_for_group} "
             f"--is_single_in_groupTest=TRUE "
-            f"--IsOutputBETASEinBurdenTest=TRUE " #
         )
-    command += f"--IsOutputAFinCaseCtrl=TRUE 2>&1 | tee {run_saige_task.stdout}; " #
+    command += f"--LOCO=FALSE 2>&1 | tee {run_saige_task.stdout}; "
     if analysis_type == "gene":
         command += (
             f"input_length=$(wc -l {group_file} | awk '{{print $1}}'); "
@@ -381,6 +378,13 @@ def run_saige(
             f"rm -f {run_saige_task.result[f'{add_suffix}gene.txt']} exit 1; fi; fi"
         )
     run_saige_task.command(command)
+    # Check paths:
+    if analysis_type == "gene":
+        run_saige_task.command(f'dir={run_saige_task.result[f"gene.txt"]}')
+        run_saige_task.command(f'parentdir="$(dirname "$dir")"')
+        run_saige_task.command(f'ls -lh $parentdir')
+        run_saige_task.command(f'ls -lh $parentdir/result')
+
     p.write_output(run_saige_task.result, output_root)
     p.write_output(run_saige_task.stdout, f"{output_root}.{analysis_type}.log")
     return run_saige_task
@@ -528,52 +532,71 @@ def export_bgen_from_mt(
     analysis_type,
     interval,
     output_dir,
-    mean_impute_missing,
+    mean_impute_missing: bool=True,
     no_adj: bool=False,
     variant_ac_filter: int = 0,
     variant_callrate_filter: float=0,
     index_only: bool=False
 ):
     outname = f"{analysis_type}_{chromosome}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
-    if not index_only:
-        mt = get_filtered_mt(analysis_type=analysis_type, filter_variants=True, filter_samples=True, adj_filter= not no_adj, pop=pop)
+    bgen_path = f"{output_dir}/{outname}.bgen"
+    # if (not index_only) or (not hl.hadoop_exists(bgen_path)):
+    mt = get_filtered_mt(analysis_type=analysis_type, filter_variants=True, filter_samples=True, adj_filter= not no_adj, pop=pop)
 
-        # Filter to interval
-        mt = hl.filter_intervals(mt, [interval])
+    # Filter to interval
+    mt = hl.filter_intervals(mt, [interval])
 
-        mt = mt.select_entries("GT")
-        mt = mt.filter_rows(
-            hl.agg.count_where(mt.GT.is_non_ref()) > 0
-        )  # Filter to non-reference sites
-        mt = mt.annotate_rows(
-            rsid=mt.locus.contig + ":" + hl.str(mt.locus.position) + "_" + mt.alleles[0] + "/" + mt.alleles[1]
-        )  # Annotate rsid
+    mt = mt.select_entries("GT")
+    mt = mt.filter_rows(
+        hl.agg.count_where(mt.GT.is_non_ref()) > 0
+    )  # Filter to non-reference sites
+    mt = mt.annotate_rows(
+        rsid=mt.locus.contig + ":" + hl.str(mt.locus.position) + "_" + mt.alleles[0] + "/" + mt.alleles[1]
+    )  # Annotate rsid
 
-        if variant_ac_filter:
-            mt = mt.filter_rows(mt.info.AC[0] > variant_ac_filter)
+    if variant_ac_filter:
+        mt = mt.filter_rows(mt.info.AC[0] > variant_ac_filter)
 
-        if variant_callrate_filter:
-            mt = mt.filter_rows(mt.info.AN/(2*N_SAMPLES[pop]) > variant_callrate_filter)
+    if variant_callrate_filter:
+        mt = mt.filter_rows(mt.info.AN/(2*N_SAMPLES[pop]) > variant_callrate_filter)
 
-        mt = mt.annotate_entries(
-            GT=hl.if_else(mt.GT.is_haploid(), hl.call(mt.GT[0], mt.GT[0]), mt.GT)
-        )
-        mt = gt_to_gp(mt)
-        mt = impute_missing_gp(mt, mean_impute=mean_impute_missing)
-        hl.export_bgen(mt, f"{output_dir}/{outname}", gp=mt.GP, varid=mt.rsid)
-    hl.index_bgen(path=f"{output_dir}/{outname}.bgen", index_file_map={f"{output_dir}/{outname}.bgen":f"{output_dir}/{outname}.bgen.idx2"}, reference_genome='GRCh38')
+    mt = mt.annotate_entries(
+        GT=hl.if_else(mt.GT.is_haploid(), hl.call(mt.GT[0], mt.GT[0]), mt.GT)
+    )
+    mt = gt_to_gp(mt)
+    mt = impute_missing_gp(mt, mean_impute=mean_impute_missing)
+    hl.export_bgen(mt, f"{output_dir}/{outname}", gp=mt.GP, varid=mt.rsid)
+    # hl.index_bgen(path=bgen_path, reference_genome='GRCh38')
 
 
 def export_gene_group_file(interval, groups, pop, output_dir):
     gene_ht = hl.read_table(get_aou_gene_map_ht_path(pop=pop, processed=True))
     gene_ht = hl.filter_intervals(gene_ht, [interval])
+    var_ht = gene_ht.select(gene=gene_ht.gene_id + '_' + gene_ht.gene_symbol + '_' + gene_ht.annotation.split(' ')[0],
+                            tag='var',
+                            info=hl.delimit(gene_ht.variants, "\t")
+                            ).add_index().key_by().drop("start")
+    anno_ht = gene_ht.select(gene=gene_ht.gene_id + '_' + gene_ht.gene_symbol + '_' + gene_ht.annotation.split(' ')[0],
+                             tag='anno',
+                             info=gene_ht.annotation
+                             ).add_index().key_by().drop("start")
+    group_ht = var_ht.union(anno_ht)
+    group_ht.show()
+    group_ht = group_ht.order_by('idx').drop('idx')
+    group_ht.export(output_dir, header=False)
 
-    gene_ht = gene_ht.filter(hl.set(groups).contains(gene_ht.annotation))
-    gene_ht.select(
-        group=gene_ht.gene_id + "_" + gene_ht.gene_symbol + "_" + gene_ht.annotation
-        + hl.if_else(gene_ht.common_variant, "_" + gene_ht.variants[0], ""),
-        variant=hl.delimit(gene_ht.variants, "\t"),
-    ).key_by().drop("start").export(output_dir, header=False)
+def index_bgen(b: hb.batch.Batch, bgen: str, depend_job=None):
+    file = b.read_input(bgen)
+    name = bgen.split('/')[-1]
+    j = b.new_job(name=f'index_{name}')
+    if depend_job is not None:
+        j.depends_on(depend_job)
+    j.image('befh/bgen:latest')
+    j.command(f'bgenix -index -g {file}')
+    j.command(f'ls {file}.bgi')
+    j.command(f'mv {file}.bgi {j.temp}')
+    b.write_output(j.temp, f'{bgen}.bgi')
+    return j
 
 
 def main(args):
@@ -607,6 +630,7 @@ def main(args):
 
     if args.pilot or (args.phenos is not None):
         phenos_to_run = PILOT_PHENOTYPES if args.pilot else args.phenos.split(",")
+        phenos_to_run = list(phenos_to_run) + ['p_0.5_0.01_1', 'p_0.5_continuous_1', 'p_1_0.01_1', 'p_1_continuous_1']
         quantitative_phenos = ['height']
     else:
         pheno_ht = hl.read_table(get_full_phenotype_path(annotation=True, random_pheno=args.random_pheno))
@@ -627,6 +651,15 @@ def main(args):
             phenos_to_run = list(raw_pheno_ht.row_value)
             quantitative_phenos = hl.eval(pheno_ht.trait_type)["continuous"]
         # TODO: create phenotype info table and add phenotype filters (min cases, etc)
+    trait_types = {}
+    for phenoname in phenos_to_run:
+        type = 'binary'
+        if (phenoname in quantitative_phenos):
+            type = "quantitative"
+        if "continuous" in phenoname:
+            type = "quantitative"
+        trait_types[phenoname] = type
+
 
     print(f"Got {len(phenos_to_run)} phenotypes...")
     if len(phenos_to_run) <= 20:
@@ -692,6 +725,7 @@ def main(args):
             else:
                 groups = args.groups.split(",")
             interval_ht = hl.read_table(GENE_INTERVAL_PATH)
+            interval_ht = interval_ht.filter(interval_ht.interval.start.contig != 'chrM')
         else:
             if not hl.hadoop_exists(VARIANT_INTERVAL_PATH):
                 intervals = []
@@ -705,12 +739,11 @@ def main(args):
                             if start_pos + chunk_size > chrom_length
                             else (start_pos + chunk_size)
                         )
-                        interval = hl.eval(
-                            hl.parse_locus_interval(
-                                f"[{chromosome}:{start_pos}-{end_pos}]",
-                                reference_genome="GRCh38",
-                            )
+                        interval = hl.Interval(
+                            hl.Locus(chromosome, start_pos, reference_genome='GRCh38'),
+                            hl.Locus(chromosome, end_pos, reference_genome='GRCh38')
                         )
+
                         intervals.append(interval)
                 import pandas as pd
                 df = pd.DataFrame({'interval': intervals})
@@ -724,10 +757,13 @@ def main(args):
         )
         print(f"Docker image: {SAIGE_DOCKER_IMAGE}...")
 
-        chromosome = f"chr{args.chrom}"
+        if args.chrom is None:
+            chromosome = 'all'
+        else:
+            chromosome = f"chr{args.chrom}"
         for pop in pops:
             b = hb.Batch(
-                name=f"saige_aou_{pop}_{chromosome}",
+                name=f"saige_{analysis_type}_aou_{pop}_{'test' if args.test else chromosome}",
                 backend=backend,
                 default_image=SAIGE_DOCKER_IMAGE,
                 default_storage="500Mi",
@@ -746,7 +782,7 @@ def main(args):
             )
 
             overwrite_null_models = args.create_null_models
-            null_model_dir = get_aou_saige_utils_root(pop=pop, name="null_glmm", random_pheno=args.random_pheno)
+            null_model_dir = get_aou_saige_utils_root(pop=pop, name="null_glmm")
             null_models_already_created = {}
             if not overwrite_null_models and hl.hadoop_exists(null_model_dir):
                 null_models_already_created = {
@@ -756,12 +792,15 @@ def main(args):
             null_models = {}
             pheno_exports = {}
             for phenoname in phenos_to_run:
-                trait_type = ("quantitative"if (phenoname in quantitative_phenos) or ("coutinuous" in phenoname) else "binary")
+                random_pheno = args.random_pheno
+                random_pheno = True if phenoname.startswith('p_') else random_pheno
+
                 null_glmm_root = f"{null_model_dir}/phenotype_{phenoname}"
                 model_file_path = f"{null_glmm_root}.rda"
                 variance_ratio_file_path =  f"{null_glmm_root}.varianceRatio.txt"
+                trait_type = trait_types[phenoname]
 
-                pheno_file = b.read_input(f'{get_aou_saige_utils_root(pop=pop, name="pheno_file", random_pheno=args.random_pheno)}/phenotype_{phenoname}.tsv')
+                pheno_file = b.read_input(f'{get_aou_saige_utils_root(pop=pop, name="pheno_file", random_pheno=random_pheno)}/phenotype_{phenoname}.tsv')
                 pheno_exports[phenoname] = pheno_file
 
                 if (
@@ -774,12 +813,13 @@ def main(args):
                 else:
                     if args.skip_any_null_models:
                         break
+                    print(f'Running null model for {pop.upper()} {phenoname} : {trait_type}')
                     fit_null_task = fit_null_glmm(
                         b,
                         output_root=null_glmm_root,
                         phenoname=phenoname,
                         pheno_file=pheno_exports[phenoname],
-                        trait_type=trait_type,
+                        trait_type=trait_types[phenoname],
                         covariates=covariates,
                         plink_file_root=get_aou_sites_for_grm_path(pop=pop, extension="plink", pruned=True),
                         docker_image=SAIGE_DOCKER_IMAGE,
@@ -807,13 +847,19 @@ def main(args):
             bgens_already_created = {}
             if not overwrite_bgens and hl.hadoop_exists(bgen_dir):
                 bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir)}
-            print(f'Found {int(len(bgens_already_created)/4)} Bgens in directory...')
+            factor = 3 if analysis_type=='variant' else 4
+            print(f'Found {int(len(bgens_already_created)/factor)} Bgens in directory...')
 
             bgens = {}
-            sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
-            intervals = sub_interval_ht.aggregate(
-                hl.agg.collect(sub_interval_ht.interval)
-            )
+            if chromosome != 'all':
+                sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
+                intervals = sub_interval_ht.aggregate(
+                    hl.agg.collect(sub_interval_ht.interval)
+                )
+            else:
+                intervals = interval_ht.aggregate(
+                    hl.agg.collect(interval_ht.interval)
+                )
             if args.hail_image is None:
                 image = hb.build_python_image(
                     "us-central1-docker.pkg.dev/aou-neale-gwas/hail-batch/hail_gnomad_python_3.9",
@@ -822,34 +868,38 @@ def main(args):
                 )
             else:
                 image = args.hail_image
-                
+
             for interval in intervals:
                 bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
                 if (f"{bgen_root}.bgen" not in bgens_already_created) or args.index_only:
                     bgen_task = b.new_python_job(
-                        name=f"{analysis_type}_analysis_export_{interval}_bgen"
+                        name=f"{analysis_type}_analysis_export_{str(interval)}_bgen"
                     )
 
                     bgen_task.image(image)
                     bgen_task.call(
                         export_bgen_from_mt,
                         pop=pop,
-                        chromosome=chromosome,
+                        chromosome=interval.start.contig,
                         analysis_type=analysis_type,
                         interval=interval,
                         output_dir=bgen_dir,
-                        mean_impute_missing=args.mean_impute_missing,
+                        mean_impute_missing=True,
                         no_adj=args.no_adj,
                         variant_ac_filter= 0,
                         variant_callrate_filter=0,
                         index_only=args.index_only
                     )
                     bgen_task.attributes["pop"] = pop
-                    bgen_task.attributes["chromosome"] = chromosome
+                    bgen_task.attributes["chromosome"] = interval.start.contig
                     bgen_task.attributes["analysis_type"] = analysis_type
+                    bgen_index = index_bgen(b, f"{bgen_root}.bgen", bgen_task)
+                    bgen_index.attributes["pop"] = pop
+                    bgen_index.attributes["chromosome"] = interval.start.contig
+                    bgen_index.attributes["analysis_type"] = analysis_type
                 if (f"{bgen_root}.gene.txt" not in bgens_already_created) and analysis_type=='gene':
                     gene_txt_task = b.new_python_job(
-                        name=f"{analysis_type}_analysis_export_{hl.eval(hl.str(interval))}_gene_txt"
+                        name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt"
                     )
                     gene_txt_task.image(HAIL_DOCKER_IMAGE)
                     gene_txt_task.call(
@@ -860,20 +910,27 @@ def main(args):
                         output_dir=f"{bgen_root}.gene.txt",
                     )
                     gene_txt_task.attributes["pop"] = pop
-                    gene_txt_task.attributes["chromosome"] = chromosome
+                    gene_txt_task.attributes["chromosome"] = interval.start.contig
+                if (not hl.hadoop_exists(f"{bgen_root}.bgen.bgi")) and  (hl.hadoop_exists(f"{bgen_root}.bgen")):
+                    bgen_index=index_bgen(b, f"{bgen_root}.bgen")
+                    bgen_index.attributes["pop"] = pop
+                    bgen_index.attributes["chromosome"] = interval.start.contig
+                    bgen_index.attributes["analysis_type"] = analysis_type
+
+
 
                 bgen_file = b.read_input_group(
                     **{
                         "bgen": f"{bgen_root}.bgen",
-                        "bgen.idx2": f"{bgen_root}.bgen.idx2",
+                        "bgen.bgi": f"{bgen_root}.bgen.bgi",
                         "sample": f"{bgen_root}.sample",
                     }
                 )
                 if analysis_type == 'gene':
                     group_file = b.read_input(f"{bgen_root}.gene.txt")
-                    bgens[hl.eval(hl.str(interval))] = (bgen_file, group_file)
+                    bgens[str(interval)] = (bgen_file, group_file)
                 else:
-                    bgens[hl.eval(hl.str(interval))] = bgen_file
+                    bgens[str(interval)] = bgen_file
                 if args.test:
                     break
 
@@ -903,24 +960,29 @@ def main(args):
                     and hl.hadoop_exists(pheno_results_dir)
                 ):
                     results_already_created = {x["path"] for x in hl.hadoop_ls(pheno_results_dir)}
-                print(f'Found {int(len(results_already_created) / 4)} results in directory...')
+                print(f'Found {int(len(results_already_created) / 4)} results in {phenoname} directory...')
 
                 saige_tasks = []
-                sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
-                intervals = sub_interval_ht.aggregate(
-                    hl.agg.collect(sub_interval_ht.interval)
-                )
+                if chromosome != 'all':
+                    sub_interval_ht = interval_ht.filter(interval_ht.interval.start.contig == chromosome)
+                    intervals = sub_interval_ht.aggregate(
+                        hl.agg.collect(sub_interval_ht.interval)
+                    )
+                else:
+                    intervals = interval_ht.aggregate(
+                        hl.agg.collect(interval_ht.interval)
+                    )
                 for interval in intervals:
                     results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
                     group_file = None
                     max_maf_for_group_test = None
                     groups = None
                     if analysis_type == "gene":
-                        bgen_file, group_file = bgens[hl.eval(hl.str(interval))]
+                        bgen_file, group_file = bgens[str(interval)]
                         max_maf_for_group_test = 0.001
                         groups = args.groups
                     else:
-                        bgen_file = bgens[hl.eval(hl.str(interval))]
+                        bgen_file = bgens[str(interval)]
 
                     if (
                         overwrite_results
@@ -928,6 +990,7 @@ def main(args):
                         not in results_already_created
                     ):
                         samples_file = b.read_input(get_aou_sample_file_path(pop=pop))
+
                         saige_task = run_saige(
                             p=b,
                             output_root=results_path,
@@ -935,17 +998,18 @@ def main(args):
                             variance_ratio_file=variance_ratio_file,
                             sparse_grm_file=sparse_grm[sparse_grm_extension],
                             bgen_file=bgen_file,
-                            samples_file=samples_file,
+                            samples_file=samples_file,# bgen_file['sample']
                             docker_image=SAIGE_DOCKER_IMAGE,
                             group_file=group_file,
-                            trait_type=trait_type,
-                            chrom=chromosome,
+                            groups=groups,
+                            trait_type=trait_types[phenoname],
+                            chrom=interval.start.contig,
                             min_mac=1,
                             min_maf=0,
                             max_maf_for_group=max_maf_for_group_test,
                         )
                         saige_task.attributes.update(
-                            {"interval": hl.eval(hl.str(interval)), "pop": pop, "chromosome":chromosome}
+                            {"interval": str(interval), "pop": pop, "chromosome":interval.start.contig}
                         )
                         saige_task.attributes.update(
                             {"phenotype": copy.deepcopy(phenoname)}
@@ -955,66 +1019,115 @@ def main(args):
                         break
                 if args.test:
                     break
+
+            # res_tasks = []
+            # if (
+            #     overwrite_results
+            #     or args.overwrite_hail_results
+            #     or f"{pheno_results_dir}/variant_results.ht"
+            #     not in results_already_created
+            #     or not hl.hadoop_exists(
+            #         f"{pheno_results_dir}/variant_results.ht/_SUCCESS"
+            #     )
+            # ):
+            #     null_glmm_root = (
+            #         f"{null_model_dir}/phenotype_{phenoname}.{analysis_type}.log"
+            #     )
+            #
+            #     prefix = f"{pheno_results_dir}/result_{phenoname}_chr{{chrom}}_{str(1).zfill(9)}"
+            #     saige_log = f"{prefix}.{analysis_type}.log"
+            #
+            #     load_task = load_results_into_hail(
+            #         b,
+            #         pheno_results_dir,
+            #         phenoname,
+            #         saige_tasks,
+            #         get_aou_util_path("vep_corrected"),
+            #         HAIL_DOCKER_IMAGE,
+            #         saige_log=saige_log,
+            #         analysis_type=analysis_type,
+            #         n_threads=n_threads,
+            #         null_glmm_log=null_glmm_root,
+            #         reference=reference,
+            #         legacy_annotations=True,
+            #         log_pvalue=True,
+            #     )
+            #     load_task.attributes["pop"] = pop
+            #     res_tasks.append(load_task)
+            #     qq_export, qq_plot = qq_plot_results(
+            #         b,
+            #         pheno_results_dir,
+            #         res_tasks,
+            #         HAIL_DOCKER_IMAGE,
+            #         QQ_DOCKER_IMAGE,
+            #         n_threads=n_threads,
+            #     )
+            #     qq_export.attributes.update({"pop": pop})
+            #     qq_export.attributes.update({"phenotype": copy.deepcopy(phenoname)})
+            #     qq_plot.attributes.update({"pop": pop})
+            #     qq_plot.attributes.update({"phenotype": copy.deepcopy(phenoname)})
+
+            def get_tasks_from_pipeline(p):
+                return dict(Counter(map(lambda x: x.name, p.select_jobs(""))))
+
+            logger.info(
+                f'Setup took: {time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))}'
+            )
+            logger.info(f"Submitting: {get_tasks_from_pipeline(b)}")
+            logger.info(f"Total size: {sum([len(x._pretty()) for x in b.select_jobs('')])}")
+            logger.info(f"Finished: {get_tasks_from_pipeline(b)}")
+            b.run()
+
+    if args.load_hail_results:
+        analysis_type = "variant" if args.single_variant_only else "gene"
+        print(f'Analysis type: {analysis_type}')
+        for pop in pops:
+            for phenoname in phenos_to_run:
+                directory = f'{get_aou_saige_results_root(analysis_type=analysis_type, pop=pop, name="result")}/phenotype_{phenoname}'
+                null_glmm_log = f'{get_aou_saige_utils_root(pop=pop, name="null_glmm")}/phenotype_{phenoname}.log'
+
+                saige_log = f'{directory}/result_{phenoname}_chr1_000000001.{analysis_type}.log'
+                # SAIGE extension: single_variant.txt
+                cases, controls = get_cases_and_controls_from_log(saige_log)
+
+                quantitative_trait = trait_types[phenoname] == 'quantitative'
+                heritability = get_heritability_from_log(null_glmm_log,
+                                                         quantitative_trait) if null_glmm_log else -1.0
+                inv_normalized = get_inverse_normalize_status(null_glmm_log) if null_glmm_log else 'NA'
+                saige_version = get_saige_version_from_log(null_glmm_log) if null_glmm_log else 'NA'
+
+                extension = '.result.singleAssoc.txt' if analysis_type == 'gene' else 'single_variant.txt'
+                if analysis_type == 'gene':
+                    load_gene_data(directory=directory,
+                                   phenoname=phenoname,
+                                   gene_ht_map_path=get_aou_gene_map_ht_path(pop=pop, processed=False),
+                                   n_cases=cases,
+                                   n_controls=controls,
+                                   heritability=heritability,
+                                   saige_version=saige_version,
+                                   inv_normalized=inv_normalized,
+                                   overwrite=args.overwrite_hail_results)
+                if not hl.hadoop_exists(f'{directory}/variant_results.ht'):
+                    load_variant_data(directory=directory,
+                                      phenoname=phenoname,
+                                      aou_vep_path=get_aou_util_path('vep'),
+                                      extension=extension,
+                                      n_cases=cases,
+                                      n_controls=controls,
+                                      heritability=heritability,
+                                      saige_version=saige_version,
+                                      inv_normalized=inv_normalized,
+                                      overwrite=args.overwrite_hail_results,
+                                      legacy_annotations=args.legacy_annotations)
+                ht = hl.read_table(f'{directory}/variant_results.ht')
+                ht.show()
+                print(ht.count())
+                if args.test:
+                    break
             if args.test:
                 break
-            b.run()
-        #     res_tasks = []
-        #     if (
-        #         overwrite_results
-        #         or args.overwrite_hail_results
-        #         or f"{pheno_results_dir}/variant_results.ht"
-        #         not in results_already_created
-        #         or not hl.hadoop_exists(
-        #             f"{pheno_results_dir}/variant_results.ht/_SUCCESS"
-        #         )
-        #     ):
-        #         null_glmm_root = (
-        #             f"{null_model_dir}/phenotype_{phenoname}.{analysis_type}.log"
-        #         )
-        #
-        #         prefix = f"{pheno_results_dir}/result_{phenoname}_chr{{chrom}}_{str(1).zfill(9)}"
-        #         saige_log = f"{prefix}.{analysis_type}.log"
-        #
-        #         load_task = load_results_into_hail(
-        #             b,
-        #             pheno_results_dir,
-        #             phenoname,
-        #             saige_tasks,
-        #             get_aou_util_path("vep_corrected"),
-        #             HAIL_DOCKER_IMAGE,
-        #             saige_log=saige_log,
-        #             analysis_type=analysis_type,
-        #             n_threads=n_threads,
-        #             null_glmm_log=null_glmm_root,
-        #             reference=reference,
-        #             legacy_annotations=True,
-        #             log_pvalue=True,
-        #         )
-        #         load_task.attributes["pop"] = pop
-        #         res_tasks.append(load_task)
-        #         qq_export, qq_plot = qq_plot_results(
-        #             b,
-        #             pheno_results_dir,
-        #             res_tasks,
-        #             HAIL_DOCKER_IMAGE,
-        #             QQ_DOCKER_IMAGE,
-        #             n_threads=n_threads,
-        #         )
-        #         qq_export.attributes.update({"pop": pop})
-        #         qq_export.attributes.update({"phenotype": copy.deepcopy(phenoname)})
-        #         qq_plot.attributes.update({"pop": pop})
-        #         qq_plot.attributes.update({"phenotype": copy.deepcopy(phenoname)})
-        #
-        # def get_tasks_from_pipeline(p):
-        #     return dict(Counter(map(lambda x: x.name, p.select_jobs(""))))
-        #
-        # logger.info(
-        #     f'Setup took: {time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))}'
-        # )
-        # logger.info(f"Submitting: {get_tasks_from_pipeline(b)}")
-        # logger.info(f"Total size: {sum([len(x._pretty()) for x in b.select_jobs('')])}")
-        # logger.info(f"Finished: {get_tasks_from_pipeline(b)}")
-        # b.run()
+
+
 
 
 if __name__ == "__main__":
@@ -1039,12 +1152,18 @@ if __name__ == "__main__":
         "--export_phenos", help="Export phenotype tsv files", action="store_true"
     )
     parser.add_argument(
+        "--load_hail_results", help="Load results into hail", action="store_true"
+    )
+    parser.add_argument(
         "--create_null_models",
         help="Force creation of null models",
         action="store_true",
     )
     parser.add_argument(
         "--create_bgens", help="Force creation of Bgen files", action="store_true"
+    )
+    parser.add_argument(
+        "--overwrite_bgens", help="Force run of Bgens", action="store_true"
     )
     parser.add_argument(
         "--overwrite_results", help="Force run of SAIGE tests", action="store_true"
@@ -1054,6 +1173,9 @@ if __name__ == "__main__":
         help="Force run of results loading",
         action="store_true",
     )
+    parser.add_argument('--legacy_annotations', help='Use old annotation picking (preferred for genotype data)',
+                        action='store_true')
+
     parser.add_argument(
         "--test",
         help="Test run of pipeline, using chromosome 1 only",
@@ -1071,13 +1193,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--groups",
         help="Comma-separated list of functional groups used for gene-based test ",
-        default="pLoF,missense|LC,pLoF|missense|LC,synonymous,missense",
+        default="pLoF,missense|LC,synonymous",
     )
     parser.add_argument(
         "--pops", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
     )
     parser.add_argument(
-        "--chrom", help="chromosome to run", default="1"
+        "--chrom", help="chromosome to run"
     )
     parser.add_argument(
         "--pilot", help="Run pilot phenotypes only", action="store_true"
