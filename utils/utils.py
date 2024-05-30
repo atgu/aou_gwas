@@ -1,21 +1,45 @@
 import hail as hl
 import pandas as pd
 from .resources import *
-
-GENE_INTERVAL_PATH = (
-    f"gs://aou_wlu/data/group_positions_{N_GENE_PER_GROUP}_protein_coding.ht"
-)
+from typing import Union
+import hailtop.fs as hfs
+import pickle
 
 
 root = "gs://aou_wlu"
 data_path = f"{root}/data"
 test_path = f"{root}/test"
-gtf_path = "gs://hail-common/references/gencode/gencode.v29.annotation.gtf.bgz"
+
 
 
 def parse_empty_missing(v, f):
     new_v = f(v)
     return hl.if_else((hl.len(v) == 0), hl.missing(new_v.dtype), new_v)
+
+def write_pickle_dict(output: str, dict: dict):
+    with hfs.open(output, "wb") as f:
+        pickle.dump(dict, f)
+    f.close()
+
+def read_pickle_dict(dict_path: str):
+    dict = pd.read_pickle(dict_path)
+    return dict
+
+def irnt(he: hl.expr.Expression, output_loc: str = 'irnt'):
+    ht = he._indices.source
+    n_rows = ht.aggregate(hl.agg.count_where(hl.is_defined(he)))
+    print(n_rows)  # count non-missings
+    ht = ht.order_by(he).add_index()
+    ht = ht.annotate(**{output_loc: hl.qnorm((ht.idx + 0.5) / n_rows)})
+    ht = ht.annotate(**{output_loc: hl.or_missing(~hl.is_nan(ht[output_loc]), ht[output_loc])})
+    return ht
+    # def irnt(he: hl.expr.Expression, output_loc: str = 'irnt'):
+    #     ht = he._indices.source
+    #     n_rows = ht.aggregate(hl.agg.count_where(hl.is_defined(ht.x))) # count non-missings
+    #     ht = ht.order_by(he).add_index()
+    #     return ht.annotate(**{output_loc: hl.qnorm((ht.idx + 0.5) / n_rows)})
+    #     # 1) add hl.or_missing(hl.qnorm)
+    #     # 2) use approx_cdf for later runs
 
 
 def get_vat_field_types():
@@ -103,15 +127,23 @@ def group_gene_lens(ht, n, overwrite=False):
     return ht
 
 
-def group_gene_interval(gtf, n, overwrite=False):
-    gtf = gtf.filter(gtf.feature == "gene")
+def group_gene_interval(gtf, n, path, overwrite=False):
+    from collections import Counter
+    gtf = gtf.filter((gtf.feature == 'gene') & (gtf.gene_type == 'protein_coding'))
     gtf = gtf.annotate(
         chrom=gtf.interval.start.contig,
         start_pos=gtf.interval.start.position,
         end_pos=gtf.interval.end.position,
     )
+    gtf = gtf.annotate(length=gtf.end_pos - gtf.start_pos + 1)
     gtf = gtf.add_index()
+
     n_gene = gtf.group_by("chrom").aggregate(n_gene_per_chrom=hl.agg.count())
+    n_gene = n_gene.annotate(n_gene_per_chrom_round=
+                             hl.if_else(n_gene.n_gene_per_chrom % n > 0,
+                                        n_gene.n_gene_per_chrom + n - n_gene.n_gene_per_chrom % n,
+                                        n_gene.n_gene_per_chrom
+                                        ))
     n_gene = n_gene.annotate(chrom_index=n_gene.chrom[3:])
     n_gene = n_gene.annotate(
         chrom_index=hl.case()
@@ -122,23 +154,46 @@ def group_gene_interval(gtf, n, overwrite=False):
     )
     n_gene = n_gene.annotate(chrom_index=hl.int64(n_gene.chrom_index))
     n_gene = n_gene.order_by("chrom_index")
+
     n_gene_lst = n_gene.aggregate(
         hl.cumulative_sum(hl.agg.collect(n_gene.n_gene_per_chrom))
     )
     n_gene_lst.insert(0, 0)
     n_gene_lst.pop()
+    print('------- Cumulative number of genes per chromosome: ---------')
+    print(n_gene_lst)
+
+    n_gene_round_lst = n_gene.aggregate(hl.cumulative_sum(hl.agg.collect(n_gene.n_gene_per_chrom_round)))
+    n_gene_round_lst.insert(0, 0)
+    n_gene_round_lst.pop()
+    print('------- Cumulative number of genes per chromosome (rounded): ---------')
+    print(n_gene_round_lst)
+
 
     chrom_lst = [f"chr{i + 1}" for i in range(22)] + ["chrX", "chrY", "chrM"]
-    n_gene_df = pd.DataFrame(data={"chrom": chrom_lst, "cum_n_gene": n_gene_lst})
+    n_gene_df = pd.DataFrame(data={'chrom': chrom_lst, 'cum_n_gene': n_gene_lst, 'cum_n_gene_round':n_gene_round_lst})
     n_gene_ht = hl.Table.from_pandas(n_gene_df, key="chrom")
+    print(n_gene_ht.show(26))
 
-    gtf = gtf.annotate(n_previous_genes=n_gene_ht[gtf.chrom].cum_n_gene)
+    gtf = gtf.annotate(n_previous_genes = n_gene_ht[gtf.chrom].cum_n_gene,
+                       n_previous_genes_round = n_gene_ht[gtf.chrom].cum_n_gene_round,)
     gtf = gtf.annotate(
         new_idx=hl.if_else(
-            gtf.n_previous_genes > 0, gtf.idx + n - gtf.n_previous_genes % n, gtf.idx
+            gtf.n_previous_genes > 0, gtf.idx + gtf.n_previous_genes_round - gtf.n_previous_genes, gtf.idx
         )
     )
+
     gtf = gtf.annotate(group_id=gtf.new_idx // n)
+    group_cnt = gtf.group_by('group_id').aggregate(cnt=hl.agg.count(),
+                                                   group_length=hl.agg.sum(gtf.length))
+    group_dict = gtf.aggregate(hl.agg.counter(gtf.group_id))
+    print(Counter(group_dict.values()))
+
+    gtf = gtf.annotate(n_genes_per_group=group_cnt[gtf.group_id].cnt)
+    gtf = gtf.annotate(group_id=hl.if_else(gtf.n_genes_per_group < (n/2), gtf.group_id - 1, gtf.group_id))
+    group_dict = gtf.aggregate(hl.agg.counter(gtf.group_id))
+    print(Counter(group_dict.values()))
+
     gtf = gtf.select(
         "gene_name",
         "gene_id",
@@ -153,15 +208,18 @@ def group_gene_interval(gtf, n, overwrite=False):
         "n_previous_genes",
     )
 
-    gtf.checkpoint(
-        f"{data_path}/gene_group_by_position_{n}_final.ht",
+    sub_gtf = gtf.checkpoint(
+        f"{path[:-3]}_tmp.ht",
         _read_if_exists=not overwrite,
         overwrite=overwrite,
     )
-    group_ht = gtf.group_by("group_id", "chrom").aggregate(
-        group_start=hl.agg.min(gtf.start_pos),
-        group_end=hl.agg.max(gtf.end_pos),
-        genes=hl.agg.collect(gtf.gene_name),
+
+    # sub_gtf.show()
+
+    group_ht = sub_gtf.group_by("group_id", "chrom").aggregate(
+        group_start=hl.agg.min(sub_gtf.start_pos),
+        group_end=hl.agg.max(sub_gtf.end_pos),
+        genes=hl.agg.collect(sub_gtf.gene_name),
     )
     group_ht = group_ht.annotate(
         interval=hl.locus_interval(
@@ -174,8 +232,8 @@ def group_gene_interval(gtf, n, overwrite=False):
         )
     )
 
-    group_ht.write(
-        f"{data_path}/group_positions_{n}.ht",
+    group_ht = group_ht.checkpoint(
+        path,
         _read_if_exists=not overwrite,
         overwrite=overwrite,
     )
@@ -187,10 +245,10 @@ def gt_to_gp(mt, location: str = "GP"):
     return mt.annotate_entries(
         **{
             location: hl.or_missing(
-                hl.is_defined(mt.LGT),
+                hl.is_defined(mt.GT),
                 hl.map(
                     lambda i: hl.cond(
-                        mt.LGT.unphased_diploid_gt_index() == i, 1.0, 0.0
+                        mt.GT.unphased_diploid_gt_index() == i, 1.0, 0.0
                     ),
                     hl.range(0, hl.triangle(hl.len(mt.alleles))),
                 ),
@@ -284,3 +342,4 @@ def get_vat_field_types():
     ]:
         types[x] = hl.tarray(hl.tstr)
     return types
+
