@@ -62,9 +62,9 @@ def annotation_case_builder_ukb_legacy(worst_csq_by_gene_canonical_expr):
             .or_missing())
 
 
-def create_gene_map_ht(context_ht, indel_ht, check_gene_contigs=False, freq_field=None):
+def create_gene_map_ht(snpindel_ht, check_gene_contigs=False, freq_field=None):
     from gnomad.utils.vep import process_consequences
-
+    
     def format_vep_ht(ht, freq_field, check_gene_contigs):
         fields = ['variant_id', 'gene_id', 'gene_symbol', 'annotation']
         if freq_field is not None:
@@ -85,25 +85,27 @@ def create_gene_map_ht(context_ht, indel_ht, check_gene_contigs=False, freq_fiel
             )
             assert gene_contigs.all(hl.len(gene_contigs.contigs) == 1)
         ht = ht.annotate(gene_id=ht.vep.worst_csq_by_gene_canonical.gene_id,
-                         gene_symbol=ht.vep.worst_csq_by_gene_canonical.gene_symbol,)
-
+                         gene_symbol=ht.vep.worst_csq_by_gene_canonical.gene_symbol)
         ht = ht.select(**{field: ht[field] for field in fields})
+        
         return ht
 
-    context_ht = format_vep_ht(context_ht, freq_field, check_gene_contigs)
-    indel_ht = format_vep_ht(indel_ht, freq_field, check_gene_contigs)
-    ht = context_ht.union(indel_ht)
-    collect_field = (ht.variant_id, ht._af) if freq_field is not None else ht.variant_id
-    gene_map_ht = ht.group_by(
-        gene_id=ht.gene_id,
-        gene_symbol=ht.gene_symbol,
+    snpindel_ht = format_vep_ht(snpindel_ht, freq_field, check_gene_contigs)
+    
+    collect_field = (snpindel_ht.variant_id, snpindel_ht._af) if freq_field is not None else snpindel_ht.variant_id
+    gene_map_ht = snpindel_ht.group_by(
+        gene_id=snpindel_ht.gene_id,
+        gene_symbol=snpindel_ht.gene_symbol,
     ).partition_hint(100).aggregate(
         interval=hl.interval(
-            start=hl.locus(hl.agg.take(ht.locus.contig, 1)[0], hl.agg.min(ht.locus.position), reference_genome='GRCh38'),
-            end=hl.locus(hl.agg.take(ht.locus.contig, 1)[0], hl.agg.max(ht.locus.position), reference_genome='GRCh38')
+            start=hl.locus(hl.agg.take(snpindel_ht.locus.contig, 1)[0], 
+                           hl.agg.min(snpindel_ht.locus.position), reference_genome='GRCh38'),
+            end=hl.locus(hl.agg.take(snpindel_ht.locus.contig, 1)[0], 
+                         hl.agg.max(snpindel_ht.locus.position), reference_genome='GRCh38')
         ),
-        variants=hl.agg.group_by(ht.annotation, hl.agg.collect(collect_field)),
+        variants=hl.agg.group_by(snpindel_ht.annotation, hl.agg.collect(collect_field)),
     )
+    
     return gene_map_ht
 
 
