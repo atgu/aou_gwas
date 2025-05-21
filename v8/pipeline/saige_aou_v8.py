@@ -17,20 +17,167 @@ from hailtop.batch.batch import Batch
 from collections import Counter
 from shlex import quote as shq
 import time
+from typing import *
 from tqdm import tqdm
-
-# from aou_gwas import *  # for dataproc
-from utils.utils import *  # for QoB
-from utils.resources import *  # for QoB
-from utils.results_loading import * # for QoB
+import warnings
 
 def range_table(log_file):
     import hail as hl
     hl.init(log=log_file)
     print(hl.utils.range_table(10)._force_count())
 
-################################################ Copy-paste resources.py - Remove after docker image is built ################################################
 
+TRANCHE = "v8"
+MY_BUCKET = 'gs://aou_wlu'
+ANALYSIS_BUCKET = "gs://aou_analysis/v8"
+DATA_PATH = f'{ANALYSIS_BUCKET}/data'
+TMP_BUCKET = 'gs://aou_tmp/v8'
+
+N_GENE_PER_GROUP = 100
+CHUNK_SIZE = {'all': int(1.25e6),'eur': int(6.25e6), "afr": int(1.25e7), "amr": int(1.25e7), "eas": int(1.25e7), "mid": int(1.25e7), "sas": int(1.25e7)}
+# old_CHUNK_SIZE = {'all': int(1.25e6),'eur': int(1.25e7), "afr": int(2.5e7), "amr": int(2.5e7), "eas": int(2.5e7), "mid": int(2.5e7), "sas": int(2.5e7)}
+REFERENCE = "GRCh38"
+CHROMOSOMES = list(map(str, range(1, 23))) + ["X", "Y"]
+
+PILOT_PHENOTYPES = ["height", "heart-rate-mean", "A10BJ", "A10BJ06", "random_0.5_continuous_1", "random_0.5_0.01_1", "random_0.5_0.5_1", "random_0.5_0.2_1", 
+                    "random_0.5_0.1_1", "random_0.5_0.001_1"]
+PILOT_PHENOTYPES = PILOT_PHENOTYPES + [f'{pheno}_male' for pheno in PILOT_PHENOTYPES] + [f'{pheno}_female' for pheno in PILOT_PHENOTYPES] + \
+                    ["Birth_to_PULMHEART_amr_ALL", "Birth_to_CAD_eas_ALL", "Birth_to_CAD_sas_ALL", "Birth_to_MI_eur_ALL", "Birth_to_DEMENTIA_eur_ALL",
+                    "Birth_to_ATHSCLE_eur_ALL", "HYPTENSESS_to_MI_eur_ALL", "PARKINSON_to_DEMENTIA_eur_ALL", "T2D_to_ATHSCLE_eur_ALL", 'Birth_to_LUNGCA_afr_ALL']
+PHENO_CATEGORIES = ['physical_measurement', 'r_drug', 'pfhh_survey', 'random_pheno', 'lab_measurement', 'mcc2_phecode', 'mcc2_phecodex', 'onset', 'progression']
+PHENO_CATEGORIES_MT = ['physical_measurement', 'r_drug', 'pfhh_survey', 'mcc2_phecode', 'mcc2_phecodex']
+PHENO_CATEGORIES_HT = ['lab_measurement', 'onset', 'progression']
+GATE_CATEGORIES = ['onset', 'progression']
+BINARY_CATEGORIES = ['r_drug', 'pfhh_survey', 'mcc2_phecode', 'mcc2_phecodex']
+QUANTITATIVE_CATEGORIES = ['physical_measurement', 'lab_measurement']
+ANCESTRIES = ['AFR', 'AMR', 'EAS', 'EUR', 'MID', 'SAS']    
+N_SAMPLES_PRUNED = {'afr': 77444, 'amr': 71540, 'eas': 9488, 'eur': 227273, 'mid': 1153, 'sas': 5132, 'all': 0}
+
+
+################################################ Copy-paste constants.py - Remove after docker image is built ################################################
+def get_adj_expr(
+   gt_expr: hl.expr.CallExpression,
+   gq_expr: Union[hl.expr.Int32Expression, hl.expr.Int64Expression],
+   ad_expr: hl.expr.ArrayNumericExpression,
+   adj_gq: int = 30,
+   adj_ab: float = 0.2,
+) -> hl.expr.BooleanExpression:
+   """
+   Get adj genotype annotation.
+
+
+   Defaults correspond to gnomAD values.
+   """
+   return (
+       (gq_expr >= adj_gq)
+       & (
+           hl.case()
+           .when(~gt_expr.is_het(), True)
+           .when(gt_expr.is_het_ref(), ad_expr[gt_expr[1]] / hl.sum(ad_expr) >= adj_ab)
+           .default(
+               (ad_expr[gt_expr[0]] / hl.sum(ad_expr) >= adj_ab)
+               & (ad_expr[gt_expr[1]] / hl.sum(ad_expr) >= adj_ab)
+           )
+       )
+   )
+
+def annotate_adj(
+       mt: hl.MatrixTable,
+       adj_gq: int = 30,
+       adj_ab: float = 0.2,
+) -> hl.MatrixTable:
+   """
+   Annotate genotypes with adj criteria (assumes diploid).
+
+
+   Defaults correspond to gnomAD values.
+   """
+   if "GT" not in mt.entry and "LGT" in mt.entry:
+       print("No GT field found, using LGT instead.")
+       gt_expr = mt.LGT
+   else:
+       gt_expr = mt.GT
+
+
+   if "AD" not in mt.entry and "LAD" in mt.entry:
+       print("No AD field found, using LAD instead.")
+       ad_expr = mt.LAD
+   else:
+       ad_expr = mt.AD
+
+
+   return mt.annotate_entries(
+       adj=get_adj_expr(
+           gt_expr, mt.GQ, ad_expr, adj_gq, adj_ab
+       )
+   )
+
+def get_filtered_mt(mt_type: hl.tstr,
+                    sample_ids: hl.Table,
+                    ancestry: str='all',
+                    filter_samples: bool=True, 
+                    filter_variants: bool=True,
+                    prune_samples:bool=True,
+                    adj_filter: bool=True):
+    anc_mt_path = f'{DATA_PATH}/utils/raw_mt/{mt_type}/{ancestry.upper()}_{mt_type}.mt'
+    print(anc_mt_path)
+    if ancestry != 'all':
+        ancestry_ht = hl.read_table(f'{DATA_PATH}/utils/aou_v8_global_pca.ht')
+        ancestry_ht = ancestry_ht.filter(ancestry_ht.ancestry_pred == ancestry)
+        if not hfs.exists(f'{anc_mt_path}/_SUCCESS'):
+            mt_path = ACAF_MT_PATH if mt_type=='ACAF' else EXOME_MT_PATH
+            print(mt_path)
+            mt = hl.read_matrix_table(mt_path)
+            mt.describe()
+            print(mt.count())
+            mt = mt.filter_entries(hl.is_missing(mt.FT) | (mt.FT == 'PASS'))
+            mt = mt.filter_cols(hl.is_defined(ancestry_ht[mt.col_key]))
+            mt = mt.naive_coalesce(20000).checkpoint(anc_mt_path, overwrite=True)
+        mt = hl.read_matrix_table(anc_mt_path)
+        print(mt._force_count_cols())
+    else:
+        mt_path = ACAF_MT_PATH if mt_type=='ACAF' else EXOME_MT_PATH
+        mt = hl.read_matrix_table(mt_path)
+        mt = mt.filter_entries(hl.is_missing(mt.FT) | (mt.FT == 'PASS'))
+        mt = mt.naive_coalesce(20000).checkpoint(anc_mt_path, overwrite=True)
+        print(mt.count())
+
+    if filter_variants:
+        print(f'Filtering to global AC > 0...')
+        mt = mt.filter_rows(
+            (mt.info.AC[0] > 0)
+        )
+        
+    if filter_samples:
+        print(f'Filtering to samples with sex, ancestry defined and age <= 100...')
+        mt = mt.filter_cols(hl.is_defined(sample_ids[mt.col_key]))
+        
+    if prune_samples:
+        print(f'[{mt_type}] Filtering to samples pruned from the PCA centroid pipeline...')
+        pca_pruned_sample_tsv = f'{DATA_PATH}/utils/pca/results/aou_{ancestry.lower()}_centroid_pruned.tsv'
+        pca_pruned_sample_path = f'{DATA_PATH}/utils/pca/results/{ancestry.lower()}_pca_centroid_pruned.ht'
+        overwrite_pruned_ht = False
+        if hfs.exists(pca_pruned_sample_tsv):
+            if not hfs.exists(f'{pca_pruned_sample_path}/_SUCCESS') or overwrite_pruned_ht:
+                pruned_ht = hl.import_table(pca_pruned_sample_tsv, delimiter='\t', key='s', types = {'s':hl.tstr})
+                pruned_ht = pruned_ht.checkpoint(pca_pruned_sample_path, overwrite=overwrite_pruned_ht)
+            else: 
+                pruned_ht = hl.read_table(pca_pruned_sample_path)
+        print(pruned_ht.count())
+        pruned_ht = hl.read_table(pca_pruned_sample_path)
+        mt = mt.filter_cols(hl.is_defined(pruned_ht[mt.col_key]))
+        
+    if adj_filter:
+        """
+       Filter genotypes to adj criteria - Default:
+       GQ >= 30, het_ref_altAB >= 0.2, het_non_ref_altAB >= 0.2 , het_non_ref_refAB >= 0.2
+       """
+        print(f'Applying adj filters...')
+        mt = annotate_adj(mt)
+        mt = mt.filter_entries(mt.adj)
+        mt = mt.filter_rows(hl.agg.any(mt.GT.n_alt_alleles() >0))
+    
+    return mt
 
 ################################################ Remove after docker image is built ################################################
 
@@ -42,9 +189,78 @@ logging.basicConfig(
 logger = logging.getLogger("ALL_x_AoU_SAIGE")
 logger.setLevel(logging.INFO)
 
-HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.124-py3.9"
-SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.3.0"  # latest
+HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.133-py3.11"
+SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.4.4"  # latest
 QQ_DOCKER_IMAGE = "konradjk/saige_qq:0.2"
+
+def annotate_expected_pvalue(ht: hl.Table, method:str, p_field: str='Pvalue', k:int = 5000):
+    n = ht.count()
+    print(n)
+    ht = ht.filter(hl.is_defined(ht[p_field]))
+    keys = list(ht.key)
+    if method == 'exact':
+        ht = ht.key_by()
+        ht = ht.order_by(ht[p_field]).add_index()
+        ht = ht.key_by(*keys)
+        ht = ht.annotate(**{f'{p_field}_expected': ht.idx / (n + 1)})
+        if n % 2 == 1:
+            median = [int(n * 0.5), int(n * 0.5) + 1]
+            median_p = ht.filter((ht.idx == median[0]) | (ht.idx == median[1]) )
+        else:
+            median_p = ht.filter(ht.idx == int(n * 0.5))
+
+        median_p = median_p.aggregate(hl.agg.mean(median_p[p_field]))
+        ht = ht.drop('idx')
+
+    elif method == 'approx_cdf':
+        ht = ht.annotate_globals(ranks=ht.aggregate(hl.agg.approx_cdf(ht[p_field], k=k)))
+        ht = ht.annotate(p_rank_upper=hl.enumerate(ht.ranks['values']).find(lambda x: x[1] >= ht[p_field]))
+        ht = ht.annotate(p_rank=ht.p_rank_upper[0],
+                            upper_pvalue=ht.p_rank_upper[1])
+        ht = ht.annotate(lower_pvalue=ht.ranks['values'][ht.p_rank - 1],
+                            lower_rank=ht.ranks['ranks'][ht.p_rank - 1],
+                            upper_rank=ht.ranks['ranks'][ht.p_rank],
+                            )
+        ht = ht.annotate(
+            rank=hl.int64(hl.floor((ht.upper_rank - ht.lower_rank) / (ht.upper_pvalue - ht.lower_pvalue) * (
+                    ht.Pvalue - ht.lower_pvalue) + ht.lower_rank)))
+        import time
+        ht = ht.checkpoint(f'gs://aou_tmp/{time.time()}.ht')
+        top_ht = ht.filter((ht.rank < n * 0.01) | (ht[p_field] < 1e-3))
+        rest_ht = ht.filter((ht.rank >= n * 0.01) & (ht[p_field] >= 1e-3))
+
+        top_ht = top_ht.key_by()
+        top_ht = top_ht.order_by(top_ht[p_field]).add_index('rank')
+        top_ht = top_ht.key_by(*keys)
+        ht = top_ht.union(rest_ht)
+        ht = ht.annotate(Pvalue_expected=ht.rank / (n + 1))
+        ht = ht.drop('p_rank_upper', 'p_rank', 'upper_pvalue', 'lower_pvalue', 'lower_rank', 'upper_rank')
+
+        from bisect import bisect
+        median = hl.eval(hl.floor(n * 0.5))
+        upper_idx = bisect(hl.eval(ht.ranks[1]), median)
+        upper_rank = hl.eval(ht.ranks[1])[upper_idx]
+        lower_rank = hl.eval(ht.ranks[1])[upper_idx - 1]
+        upper_pvalue = hl.eval(ht.ranks[0])[upper_idx]
+        lower_pvalue = hl.eval(ht.ranks[0])[upper_idx - 1]
+        median_p = (median - lower_rank) / (upper_rank - lower_rank) * (
+                    upper_pvalue - lower_pvalue) + lower_pvalue
+        ht = ht.drop('ranks')
+
+    else:
+        import sys
+        sys.exit("Method should be one of ['exact', 'approx_cdf']")
+
+
+    lambda_gc = hl.eval(hl.qchisqtail(p=median_p, df=1, ncp=0, lower_tail=False) /
+                        hl.qchisqtail(p=0.5, df=1, ncp=0, lower_tail=True))
+    print(f"Lambda GC: {lambda_gc}")
+
+    ht = ht.annotate_globals(**{f'lambda_gc_{p_field}': lambda_gc})
+    ht = ht.annotate(**{f'{p_field}': hl.if_else(ht[f'{p_field}'] == 0, 1e-320, ht[f'{p_field}'])}, )
+    ht = ht.annotate(**{f'{p_field}_expected_log10': -hl.log10(ht[f'{p_field}_expected'])},)
+
+    return ht
 
 
 def load_gene_data(directory: str,
@@ -186,48 +402,21 @@ def load_variant_data(directory: str,
                       phenoname: str,
                       quantitative_trait:bool,
                       null_glmm_log: str,
-                      saige_log: str = 'NA',
                       extension: str = 'single.txt',
                       overwrite: bool = False,
                       variant_type: str = 'genome',
                       num_partitions: int = 1000):
     hl.init(
-        master='local[8]',
+        master='local[32]',
         tmp_dir=TMP_BUCKET,
+        gcs_requester_pays_configuration='aou-neale-gwas',
+        worker_memory="highmem",
+        worker_cores=8,
         default_reference="GRCh38",
     )
-    def get_cases_and_controls_from_log(log_format):
-        """
-        'gs://path/to/result_chr{chrom}_000000001.variant.log'
-        """
-        cases = controls = -1
-        for chrom in range(10, 23):
-            try:
-                with hfs.open(log_format.format(chrom=chrom)) as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith('Analyzing'):
-                            fields = line.split()
-                            if len(fields) == 6:
-                                try:
-                                    cases = int(fields[1])
-                                    controls = int(fields[4])
-                                    break
-                                except ValueError:
-                                    logger.warn(f'Could not load number of cases or controls from {line}.')
-                        elif line.endswith(
-                                'samples were used in fitting the NULL glmm model and are found in sample file') or \
-                                line.endswith('samples have been used to fit the glmm null model'):
-                            # This is ahead of the case/control count line ("Analyzing ...") above so this should be ok
-                            fields = line.split()
-                            try:
-                                cases = int(fields[0])
-                            except ValueError:
-                                logger.warn(f'Could not load number of cases or controls from {line}.')
-                return cases, controls
-            except:
-                pass
-        return cases, controls
+    ## Changelog: removed functions  get_cases_and_controls_from_log(log_format) and get_heritability_from_log(log_file, quantitative_trait: bool = False)
+    ## and related lines, since saige log has changed and does not contain those information
+    ## Example: gsutil cat gs://aou_analysis/v8/variant_results/result/SAS/phenotype_height/result_height_chr1_000000001.variant.log
 
     def get_heritability_from_log(log_file, quantitative_trait: bool = False):
         import math
@@ -277,71 +466,86 @@ def load_variant_data(directory: str,
         log_x = hl.if_else(x.contains('E'), -hl.int(x.split("E")[1]) - hl.log10(hl.float64(x.split("E")[0])), -hl.log10(hl.float64(x)))
         return log_x
 
-    n_cases, n_controls = get_cases_and_controls_from_log(saige_log)
     heritability = get_heritability_from_log(null_glmm_log,
                                              quantitative_trait) if null_glmm_log else -1.0
     inv_normalized = get_inverse_normalize_status(null_glmm_log) if null_glmm_log else 'NA'
     saige_version = get_saige_version_from_log(null_glmm_log) if null_glmm_log else 'NA'
-    output_ht_path = f'{output_ht_directory}/variant_results.ht'
-    ht = hl.import_table(f'{directory}/*.{extension}', delimiter='\t', impute=True, types = {'p.value':hl.tstr})
-    print(f'Loading: {directory}/*.{extension} ...')
-    marker_id_col = 'MarkerID'
-    # marker_id_col = 'MarkerID' if extension == 'single_variant.txt' else 'SNPID'
-    locus_alleles = ht[marker_id_col].split('_')
-    if n_cases == -1: n_cases = hl.null(hl.tint)
-    if n_controls == -1: n_controls = hl.null(hl.tint)
-    if heritability == -1.0: heritability = hl.null(hl.tfloat)
-    if saige_version == 'NA': saige_version = hl.null(hl.tstr)
-    if inv_normalized == 'NA': inv_normalized = hl.null(hl.tstr)
+    output_ht_path = f'{output_ht_directory}/{variant_type}_variant_results.ht'
+    if not hfs.exists(f'{output_ht_path}/_SUCCESS') or overwrite:
+        ht = hl.import_table(f'{directory}/*.{extension}', delimiter='\t', impute=True, types = {'p.value':hl.tstr})
+        print(f'Loading: {directory}/*.{extension} ...')
+        if heritability == -1.0: heritability = hl.null(hl.tfloat)
+        if saige_version == 'NA': saige_version = hl.null(hl.tstr)
+        if inv_normalized == 'NA': inv_normalized = hl.null(hl.tstr)
 
-    if 'N' in list(ht.row_value):
-        ht.describe()
-        ht = ht.annotate(
-            **{'p.value.NA': hl.missing(hl.tfloat64),
-               'Is.SPA': hl.missing(hl.tbool),
-               'AF_case': hl.missing(hl.tfloat64),
-               'AF_ctrl': hl.missing(hl.tfloat64),
-               'N_case': hl.missing(hl.tint32),
-               'N_ctrl': hl.missing(hl.tint32),
-               }
-        )
-        ht = ht.drop('N')
+        if 'N' in list(ht.row_value):
+            ht.describe()
+            ht = ht.annotate(
+                **{'p.value.NA': hl.missing(hl.tfloat64),
+                'Is.SPA': hl.missing(hl.tbool),
+                'AF_case': hl.missing(hl.tfloat64),
+                'AF_ctrl': hl.missing(hl.tfloat64),
+                'N_case': hl.missing(hl.tint32),
+                'N_ctrl': hl.missing(hl.tint32),
+                }
+            )
+        elif 'N_event' in list(ht.row_value):
+            ht.describe()
+            ht = ht.annotate(
+                AF_case = ht.AF_event,
+                AF_ctrl = ht.AF_censor,
+                N_case = ht.N_event,
+                N_ctrl = ht.N_censor,
+                N = ht.N_event + ht.N_censor
+            )
+        else:
+            ht = ht.annotate(N = ht.N_case + ht.N_ctrl)
 
-    ht = ht.key_by(locus=hl.locus(ht.CHR, ht.POS, reference_genome = 'GRCh38'), alleles=[ht.Allele1, ht.Allele2],
-                   phenoname=phenoname).distinct().naive_coalesce(num_partitions)
-    if marker_id_col == 'SNPID':
-        ht = ht.drop('CHR', 'POS', 'SNPID', 'Allele1', 'Allele2')
-    ht = ht.transmute(Pvalue=ht['p.value']).annotate_globals(
-        n_cases=n_cases, n_controls=n_controls, heritability=heritability, saige_version=saige_version,
-        inv_normalized=inv_normalized, log_pvalue=True)
-    ht = ht.annotate(Pvalue_log10 = parse_log_p_value(ht.Pvalue))
-    ht = ht.annotate(Pvalue = hl.float64(ht.Pvalue))
-    ht = ht.drop('Tstat', 'N_case', 'N_ctrl')
-    ht = ht.checkpoint(output_ht_path, overwrite=overwrite, _read_if_exists=not overwrite)
+        ht = ht.key_by(locus=hl.locus(ht.CHR, ht.POS, reference_genome = 'GRCh38'), alleles=[ht.Allele1, ht.Allele2],
+                    phenoname=phenoname).distinct().naive_coalesce(num_partitions)
+        ht = ht.transmute(Pvalue=ht['p.value']).annotate_globals(
+            heritability=heritability, saige_version=saige_version,
+            inv_normalized=inv_normalized)
+        ht = ht.drop('Allele1', 'Allele2')
+        ht = ht.annotate(Pvalue_log10 = parse_log_p_value(ht.Pvalue))
+        ht = ht.annotate(Pvalue = hl.float64(ht.Pvalue))
+        ht = ht.select('CHR', 'POS', 'MarkerID', 'AC_Allele2', 'AF_Allele2', 'MissingRate', 'BETA', 'SE', 'Tstat', 'var', 
+        'Pvalue', 'Pvalue_log10', 'p.value.NA', 'Is.SPA', 'AF_case', 'AF_ctrl', 'N_case', 'N_ctrl', 'N')
+        ht = ht.checkpoint(output_ht_path, overwrite=overwrite, _read_if_exists=not overwrite)
+    ht = hl.read_table(output_ht_path)
     ht.describe()
     ht.show()
-    ht.filter(hl.is_nan(ht.Pvalue) | (ht.Pvalue < 1e-100)).show()
-    print(ht.count())
-    if variant_type == 'genome':
-        ht = ht.filter(hl.case()
-                       .when(ht.Pvalue > 0.1, hl.rand_bool(0.001))
-                       .when(ht.Pvalue > 0.01, hl.rand_bool(0.01))
-                       .when(ht.Pvalue > 0.001, hl.rand_bool(0.1))
-                       .default(True))
-    else:
-        ht = ht.filter(hl.case()
-                       .when(ht.Pvalue > 0.1, hl.rand_bool(0.01))
-                       .when(ht.Pvalue > 0.01, hl.rand_bool(0.1))
-                       .default(True))
-    ht = ht.checkpoint(output_ht_path.replace('.ht', '_downsampled.ht'), overwrite=overwrite, _read_if_exists=not overwrite)
-    ht.export(output_ht_path.replace('.ht', '.txt.bgz'))
+    overflow_ht = ht.filter(hl.is_nan(ht.Pvalue) | (ht.Pvalue < 1e-1000))
+    if overflow_ht.count() > 0:
+        warnings.warn(f'Overflowed p-value found in {overflow_ht.count()} variants.')
     print(ht.count())
 
+    rsid_ht = hl.experimental.load_dataset(name='dbSNP', version='154',
+                                       reference_genome='GRCh38')
+    
+    method = 'approx_cdf'
+    success = output_ht_path.replace('.ht', f'_{method}_expected_p.ht/_SUCCESS')
+    if not hl.hadoop_exists(output_ht_path):
+        sys.exit(f'Output HT {output_ht_path} does not exist.')
+    elif (hl.hadoop_exists(output_ht_path) and not hl.hadoop_exists(success)) or overwrite:
+        ht = annotate_expected_pvalue(ht=ht, method=method, p_field='Pvalue')
+        ht = ht.annotate(rsID=rsid_ht[ht.locus, ht.alleles].rsid).key_by()
+        ht.describe()
+        ht = ht.checkpoint(output_ht_path.replace('.ht', f'_{method}_expected_p.ht'), overwrite=True)
+        ht = ht.filter(hl.case()
+                        .when(ht.Pvalue > 0.1, hl.rand_bool(0.001))
+                        .when(ht.Pvalue > 0.01, hl.rand_bool(0.01))
+                        .when(ht.Pvalue > 0.001, hl.rand_bool(0.1))
+                        .default(True))
+        ht.export(output_ht_path.replace('.ht', f'_{method}_expected_p.txt.bgz'))
+    else:
+        ht = hl.read_table(output_ht_path.replace('.ht', f'_{method}_expected_p.ht'))
+    return ht
 
 def run_saige(
     p: Batch,
     phenoname: str,
-    pop:str,
+    ancestry:str,
     output_root: str,
     model_file: str,
     variance_ratio_file: str,
@@ -390,7 +594,7 @@ def run_saige(
     MKL_OFF = "export MKL_NUM_THREADS=1; export MKL_DYNAMIC=false; export OMP_NUM_THREADS=1; export OMP_DYNAMIC=false; "
     analysis_type = "gene" if group_file is not None else "variant"
     run_saige_task: Job = (
-        p.new_job(name=f"run_saige{'' if analysis_type=='variant' else '_gene'}_{phenoname}_{pop}", attributes={"analysis_type": analysis_type, "pop": pop})
+        p.new_job(name=f"run_saige{'' if analysis_type=='variant' else '_gene'}_{phenoname}_{ancestry}", attributes={"analysis_type": analysis_type, "ancestry": ancestry})
         .cpu(1)
         .storage(storage)
         .image(docker_image)
@@ -458,10 +662,9 @@ def run_saige(
     p.write_output(run_saige_task.stdout, f"{output_root}.{analysis_type}.log")
     return run_saige_task
 
-
 def fit_null_glmm(
     p: Batch,
-    pop:str,
+    ancestry:str,
     output_root: str,
     phenoname: str,
     pheno_file: Resource,
@@ -502,15 +705,16 @@ def fit_null_glmm(
     :return:
     """
 
-    pheno_col = "value"
-    user_id_col = "person_id"
+    pheno_col = "value" if trait_type != 'survival' else "secondEvent"
+    user_id_col = "userId" if phenoname.startswith('random') else "person_id"
+    if trait_type == 'survival': user_id_col = "s"
     in_bfile = p.read_input_group(
         **{ext: f"{plink_file_root}.{ext}" for ext in ("bed", "bim", "fam")}
     )
     fit_null_task = (
         p.new_job(
-            name=f"fit_null_model_{phenoname}_{pop}",
-            attributes={"trait_type": trait_type, "pop":pop},
+            name=f"fit_null_model_{phenoname}_{ancestry}",
+            attributes={ "ancestry": ancestry},
         )
         .storage(storage)
         .image(docker_image)
@@ -555,6 +759,11 @@ def fit_null_glmm(
     if variant_type == 'exome':
         command += (f"--cateVarRatioMinMACVecExclude=0.5,1.5,2.5,3.5,4.5,5.5,10.5,15.5,20.5 " 
                     f"--cateVarRatioMaxMACVecInclude=1.5,2.5,3.5,4.5,5.5,10.5,15.5,20.5 " )
+    if trait_type == 'survival':
+        command += f"--eventTimeCol=TTE "
+        command += f"--eventTimeBinSize=1 "
+        command += f"--traceCVcutoff=0.0025 "
+        command += f"--ratioCVcutoff=0.001 "
     command += f"--nThreads={n_threads} --LOCO=FALSE 2>&1 | tee {fit_null_task.stdout}"
     command = "; ".join([bim_fix_command, command])
     fit_null_task.command(command)
@@ -567,7 +776,6 @@ def fit_null_glmm(
     p.write_output(fit_null_task.stdout, f"{output_root}.log")
     # Runtimes: 8 threads: ~5 minutes of 100% CPU (~3G RAM), followed by ~9 minutes of 800% (~6G RAM)
     return fit_null_task
-
 
 def gt_to_gp(mt, location: str = "GP"):
     return mt.annotate_entries(
@@ -598,7 +806,7 @@ def impute_missing_gp(mt, location: str = "GP", mean_impute: bool = True):
 
 
 def export_bgen_from_mt(
-    pop,
+    ancestry,
     analysis_type,
     interval,
     output_dir,
@@ -617,8 +825,12 @@ def export_bgen_from_mt(
         log=log_file
     )
     outname = f"{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
-    mt = get_filtered_mt(analysis_type=analysis_type, filter_variants=True, filter_samples=True, adj_filter= True, pop=pop, prune_samples=True)
-
+    mt_type = 'ACAF' if analysis_type == 'variant' else 'Exome'
+    print('Loading sample IDs')
+    sample_ids = hl.read_table(f'{DATA_PATH}/utils/aou_v8_hard_filter.ht')
+    print('Loading MT')
+    mt = get_filtered_mt(mt_type=mt_type, sample_ids=sample_ids, filter_variants=True, filter_samples=True, adj_filter= True, ancestry=ancestry, prune_samples=True)
+    print('MT loaded')
     # Filter to interval
     mt = hl.filter_intervals(mt, [interval])
 
@@ -630,10 +842,10 @@ def export_bgen_from_mt(
         rsid=mt.locus.contig + ":" + hl.str(mt.locus.position) + "_" + mt.alleles[0] + "/" + mt.alleles[1]
     )  # Annotate rsid
 
-    call_stats_ht = hl.read_table(get_call_stats_ht_path(pop=pop, pruned=True, analysis_type=analysis_type))
+    call_stats_ht = hl.read_table(f'{DATA_PATH}/utils/call_stats/{mt_type.lower() if mt_type == "Exome" else mt_type}_pruned/{ancestry.upper()}_{mt_type.lower() if mt_type == "Exome" else mt_type}_call_stats.ht')
     call_stats_ht = call_stats_ht.filter(
         (call_stats_ht.call_stats.AC[1] > variant_ac_filter) &
-        (call_stats_ht.call_stats.AN/(2*N_SAMPLES_PRUNED[pop]) > variant_callrate_filter)
+        (call_stats_ht.call_stats.AN/(2*N_SAMPLES_PRUNED[ancestry]) > variant_callrate_filter)
     )
     mt = mt.filter_rows(hl.is_defined(call_stats_ht[mt.row_key]))
 
@@ -665,10 +877,10 @@ def export_gene_group_file(interval, pop, output_dir):
     # group_ht = group_ht.order_by('idx').drop('idx')
     group_ht.export(output_dir, header=False, delimiter=' ')
 
-def index_bgen(b: hb.batch.Batch, pop:str, bgen: str, depend_job=None):
+def index_bgen(b: hb.batch.Batch, ancestry:str, analysis_type:str, bgen: str, depend_job=None):
     file = b.read_input(bgen)
     name = bgen.split('/')[-1]
-    j = b.new_job(name=f'index_{name}_{pop}')
+    j = b.new_job(name=f'index_{name}_{ancestry}_{analysis_type}')
     if depend_job is not None:
         j.depends_on(depend_job)
     j.image('befh/bgen:latest')
@@ -678,7 +890,15 @@ def index_bgen(b: hb.batch.Batch, pop:str, bgen: str, depend_job=None):
     b.write_output(j.temp, f'{bgen}.bgi')
     return j
 
-def export_pheno(category: str, pheno_path:str, covariates: str, pop: str, phenoname: str, binary_traits: list, phenotype_categories_in_mt: list, proportion_single_sex:float):
+def export_pheno_gate(category: str, pheno_path:str, phenoname: str, fields: str):
+    ht = hl.read_table(f'{DATA_PATH}/phenotype/{category}/{phenoname}.ht')
+    fields = fields.split(',')
+    out_ht = ht.select(**{field: ht[field] for field in fields})
+    out_ht.describe()
+    print(out_ht.count())
+    out_ht.export(pheno_path)
+
+def export_pheno(category: str, pheno_path:str, fields: str, ancestry: str, phenoname: str, binary_traits: list, proportion_single_sex:float):
     def irnt(he: hl.expr.Expression, output_loc: str = 'irnt'):
         ht = he._indices.source
         n_rows = ht.aggregate(hl.agg.count_where(hl.is_defined(he)))
@@ -688,7 +908,7 @@ def export_pheno(category: str, pheno_path:str, covariates: str, pop: str, pheno
         ht = ht.annotate(**{output_loc: hl.or_missing(~hl.is_nan(ht[output_loc]), ht[output_loc])})
         return ht
 
-    def filter_to_single_sex_by_proportion(ht, proportion_single_sex):
+    def filter_to_single_sex_by_proportion(ht, proportion_single_sex, tag='both'):
         # If proportion of male or female cases is less than `proportion_single_sex`
         # then filter to females and males respectively
         n_cases_female = ht.aggregate(
@@ -710,59 +930,75 @@ def export_pheno(category: str, pheno_path:str, covariates: str, pop: str, pheno
                 f"Female case proportion {prop_female} less than {proportion_single_sex}. Filtering to males..."
             )
             ht = ht.filter(ht.sex == 1)
+            tag = 'male_only'
         elif prop_female >= 1 - proportion_single_sex:
             print(
                 f"Female case proportion {prop_female} greater than {1 - proportion_single_sex}. Filtering to females..."
             )
             ht = ht.filter(ht.sex == 0)
+            tag = 'female_only'
+        log_row = {
+            'phenoname': phenoname,
+            'single_sex': tag,
+            'female_proportion': prop_female,
+            'single_sex_threshold': proportion_single_sex
+        }
+        log_ht = hl.Table.parallelize([log_row])
+        log_ht.export(pheno_path.replace('.tsv', '.log'))
         return ht
 
-    def load_pheno_ht(category:str, pop:str, phenotype_categories_in_mt:list):
-        def get_raw_phenotype_path(
-                name: str, parsed: bool = True, extension: str = "ht", tranche: str = TRANCHE
-        ):
-            return (
-                f'{DATA_PATH}/phenotype/{"" if parsed else "raw/"}{name}_{tranche}.{extension}'
-            )
-
-        def get_lab_measurements_path(
-                name: str, parsed: bool, extension: str = "ht", tranche: str = TRANCHE
-        ):
-            return (
-                f'{DATA_PATH}/phenotype/lab_measurements/{"" if parsed else "raw/"}measurement_{name}_{tranche}.{extension}'
-            )
-        if category in phenotype_categories_in_mt:
-            mt = hl.read_matrix_table(get_raw_phenotype_path(name=category, parsed=True, extension=f'hard_filtered.mt'))
-            pop_mt = mt.filter_rows(mt.pop == pop)
-            pheno_mt = pop_mt.filter_cols(pop_mt.phenocode == phenoname)
+    def load_pheno_ht(category:str, ancestry:str, phenoname:str):
+        if category in PHENO_CATEGORIES_MT:
+            mt = hl.read_matrix_table(f'{DATA_PATH}/phenotype/{category}_annotated.mt')
+            ancestry_mt = mt.filter_rows(mt.ancestry == ancestry)
+            pheno_mt = ancestry_mt.filter_cols(ancestry_mt.phenoname == phenoname)
             ht = pheno_mt.entries()
-        elif category == 'random_phenotypes':
-            pheno_ht = hl.read_table(get_raw_phenotype_path(name=category, parsed=True, extension=f'{pop}.ht'))
-            ht = pheno_ht.annotate(value=pheno_ht[phenoname])
-        elif category == 'lab_measurements':
-            ht = hl.read_table(get_lab_measurements_path(name=phenoname, parsed=True))
-            ht = ht.filter(ht.pop == pop)
-        overwrite = False
-        if not hfs.exists(f'gs://aou_tmp/export_pheno/{pop}_{phenoname}.ht/_SUCCESS'):
-            overwrite = True
-        ht = ht.checkpoint(f'gs://aou_tmp/export_pheno/{pop}_{phenoname}.ht', _read_if_exists= not overwrite, overwrite = overwrite)
-        # print(f"Exporting {phenoname} for {pop.upper()} (n_samples: {ht.count()})...")
+            print(f'-------{category} {ancestry} {phenoname} {ht.count()}')
+        elif category == 'random_pheno':
+            pheno_ht = hl.read_table(f'{DATA_PATH}/phenotype/random_pheno_annotated.ht')
+            ht = pheno_ht.filter(pheno_ht.ancestry == ancestry)
+            ht = ht.annotate(value=ht[phenoname])
+        elif category in PHENO_CATEGORIES_HT:
+            if category == 'lab_measurement':
+                path_name = phenoname.split('_')[0]
+                stat = phenoname.split('_')[1]
+            else:
+                path_name = phenoname
+            ht = hl.read_table(f"{DATA_PATH}/phenotype/{category}/{'lab_measurement_' if category == 'lab_measurement' else ''}{path_name}.ht")
+            ht = ht.filter(ht.ancestry == ancestry)
+            ht = ht.annotate(value=ht[f'{stat}_value'])
+        ht = ht.checkpoint(f'gs://aou_tmp/export_pheno/{ancestry}_{phenoname}.ht', overwrite = True)
+        print(f"Exporting {phenoname} for {ancestry.upper()} (n_samples: {ht.count()})...")
         return ht
-
-    ht = load_pheno_ht(category=category, pop=pop, phenotype_categories_in_mt=phenotype_categories_in_mt)
-    ht.describe()
+    tag = 'both'
+    if phenoname.endswith('_male'):
+        tag = 'male_only'
+        path_name = phenoname.replace('_male', '')
+    elif phenoname.endswith('_female'):
+        tag = 'female_only'
+        path_name = phenoname.replace('_female', '')
+    else:
+        path_name = phenoname
+    ht = load_pheno_ht(category=category, ancestry=ancestry, phenoname=path_name)
 
     if phenoname in binary_traits:
         ht = ht.annotate(value=hl.int(ht.value))
-        ht = filter_to_single_sex_by_proportion(ht=ht, proportion_single_sex=proportion_single_sex)
+        if tag == 'both':
+            ht = filter_to_single_sex_by_proportion(ht=ht, proportion_single_sex=proportion_single_sex)
     else:
         print('Computing irnt values...')
         ht = ht.annotate(value = hl.float64(ht['value']))
         ht = irnt(ht['value'], 'irnt_value')
         ht = ht.annotate(value=ht.irnt_value)
-    ht = ht.key_by('person_id')
-    fields = covariates.split(",") + ["value"]
+    user_id_col = "userId" if phenoname.startswith('random') else "person_id"
+    if category in ['onset', 'progression']: user_id_col = "s"
+    ht = ht.key_by(user_id_col)
+    fields = fields.split(",") + ["value"]
     out_ht = ht.select(**{field: ht[field] for field in fields})
+    if tag == 'male_only':
+        out_ht = out_ht.filter(out_ht.sex == 1)
+    elif tag == 'female_only':
+        out_ht = out_ht.filter(out_ht.sex == 0)
     out_ht.export(pheno_path)
 
 def write_pickle_dict(output: str, dict: dict):
@@ -784,124 +1020,79 @@ def main(args):
         worker_memory="highmem",
         worker_cores=1,
         default_reference="GRCh38",
-        app_name=f'aou_SAIGE_{args.pops.replace(",","_")}' if not args.export_phenos else "aou_export_phenos"
+        app_name=f'aou_SAIGE_{args.ancestries.replace(",","_")}' if not args.export_phenos else "aou_export_phenos"
     )
 
     num_pcs = 20
     start_time = time.time()
+    n_threads = 8
+    proportion_single_sex = 0.1
+    ancestries = args.ancestries.split(",")
+    PC_fields = [f"PC{x}" for x in range(1, num_pcs + 1)]
     basic_covars = [
         "sex",
         "age",
         "age2",
         "age_sex",
         "age2_sex",
-    ]  # TODO: add batch covariates for future release
-    covariates = ",".join(basic_covars + [f"PC{x}" for x in range(1, num_pcs + 1)])
-    n_threads = 8
-    proportion_single_sex = 0.1
-    pops = args.pops.split(",")
+    ]  
+    basic_covariates = basic_covars + PC_fields
+    basic_covariates = ",".join(basic_covariates)
 
-
-    if args.export_phenos or (not args.skip_saige) or (not args.skip_any_null_models) or (not args.skip_load_hail_results):
-        if not hfs.exists(get_phenotype_info_path(version="pheno_dict", extension="dict")):
-            all_phenos_by_group = {}
-            all_phenos_by_group['lab_measurements'] = LAB_CODES
-            if not args.skip_any_random_pheno:
-                raw_random_pheno_ht = hl.import_table(
-                    get_random_phenotype_path(pop=pops[0]),
-                    key="userId",
-                    impute=True,
-                    types={"userId": hl.tstr},
-                )
-                random_phenos_to_run = list(raw_random_pheno_ht.row_value)
-                all_phenos_by_group['random_phenotypes'] = random_phenos_to_run
-
-            for category in TRAIT_TYPEs:
-                print(f'Loading {category} information......')
-                if category in ['lab_measurements', 'random_phenotypes']:
-                    continue
-                ht = hl.read_table(get_phenotype_info_path(version=category, extension=f'hard_filtered.ht'))
-                all_phenos_by_group[category] = set(ht.phenocode.collect())
-            write_pickle_dict(output=get_phenotype_info_path(version="pheno_dict", extension="dict"), dict =all_phenos_by_group)
-
-        all_phenos_by_group = read_pickle_dict(get_phenotype_info_path(version="pheno_dict", extension="dict"))
+    if args.export_phenos or (not args.skip_saige) or (not args.skip_any_null_models) or (not args.skip_load_hail_results) or (not args.skip_bgen):
+        all_phenos_by_group = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_dict_raw.dict')
         print(f'----------Number of phenotypes per category (RAW): --------------')
-        print([(category, len(all_phenos_by_group[category])) for category in list(all_phenos_by_group.keys())])
+        print([(category, len(all_phenos_by_group[category])) for category in all_phenos_by_group.keys()])
 
         quantitative_traits = []
         binary_traits = []
-        if 'random_phenotypes' in list(all_phenos_by_group.keys()):
-            quantitative_traits = [pheno for pheno in all_phenos_by_group['random_phenotypes'] if 'continuous' in pheno]
-            binary_traits = [pheno for pheno in all_phenos_by_group['random_phenotypes'] if 'continuous' not in pheno]
-        for category in quantitative_categories:
+        gate_traits = []
+        if 'random_pheno' in all_phenos_by_group.keys():
+            quantitative_traits = [pheno for pheno in all_phenos_by_group['random_pheno'] if 'continuous' in pheno]
+            binary_traits = [pheno for pheno in all_phenos_by_group['random_pheno'] if 'continuous' not in pheno]
+        for category in QUANTITATIVE_CATEGORIES:
             quantitative_traits = quantitative_traits + list(all_phenos_by_group[category])
-        for category in binary_categories:
+        for category in BINARY_CATEGORIES:
             binary_traits = binary_traits + list(all_phenos_by_group[category])
-        print(f'Number of quantitative traits: {len(quantitative_traits)}\nNumber of binary traits: {len(binary_traits)}')
+        for category in GATE_CATEGORIES:
+            gate_traits = gate_traits + list(all_phenos_by_group[category])
+        print(f'Number of quantitative traits: {len(quantitative_traits)}\nNumber of binary traits: {len(binary_traits)}\nNumber of gate traits: {len(gate_traits)}')
 
-        phenos_to_run_by_pop = {}
-        phenos_to_run_by_pop_by_group = {}
+        phenos_to_run_by_ancestry = {}
+        phenos_to_run_by_ancestry_by_group = {}
         if args.pilot or (args.phenos is not None):
             phenos_to_run = list(PILOT_PHENOTYPES) if args.pilot else args.phenos.split(",")
+            print(phenos_to_run)
             category_lst = []
             for phenoname in phenos_to_run:
-                for category in TRAIT_TYPEs:
+                for category in PHENO_CATEGORIES:
                     if phenoname in all_phenos_by_group[category]:
                         category_lst.append(category)
-                        break
+            print(category_lst)
             category_dict = dict(zip(phenos_to_run, category_lst))
+            print(category_dict)
 
-            for pop in pops:
-                phenos_to_run_by_pop_by_group[pop] = {}
+            for ancestry in ancestries:
+                phenos_to_run_by_ancestry_by_group[ancestry] = {}
                 for category in set(category_lst):
-                    phenos_to_run_by_pop_by_group[pop][category] = [k for k, v in category_dict.items() if v == category]
-                phenos_to_run_by_pop[pop] = phenos_to_run
+                    if category in GATE_CATEGORIES:
+                        phenos_to_run_by_ancestry_by_group[ancestry][category] = [k for k, v in category_dict.items() if v == category and ancestry in k]
+                    else:
+                        phenos_to_run_by_ancestry_by_group[ancestry][category] = [k for k, v in category_dict.items() if v == category]
+                phenos_to_run_by_ancestry[ancestry] = phenos_to_run
             if len(phenos_to_run) < 20:
-                print(phenos_to_run_by_pop)
-        else:
-            if not hfs.exists(get_phenotype_info_path(version="pheno_by_pop_dict", extension="dict")) or args.overwrite_dict:
-                lab_phenos_by_pop = read_pickle_dict(get_phenotype_info_path(version="lab_by_pop_dict", extension="dict"))
-                for pop in pops:
-                    phenos_to_run_by_pop[pop] = lab_phenos_by_pop[pop]
-                    phenos_to_run_by_pop_by_group[pop] = {}
-                    phenos_to_run_by_pop_by_group[pop]['lab_measurements'] = lab_phenos_by_pop[pop]
-                    if 'random_phenotypes' in list(all_phenos_by_group.keys()):
-                        random_pheno_lst = [x for x in all_phenos_by_group['random_phenotypes'] if x.endswith(('_1', '_2', '_3', '_4', '_5'))]
-                        print(random_pheno_lst)
-                        phenos_to_run_by_pop_by_group[pop]['random_phenotypes'] = random_pheno_lst
-                        phenos_to_run_by_pop[pop] = phenos_to_run_by_pop[pop] + random_pheno_lst
-
-                for category in TRAIT_TYPEs:
-                    if category in ['lab_measurements', 'random_phenotypes']: continue
-                    ht = hl.read_table(get_phenotype_info_path(version=category, extension=f'hard_filtered.ht'))
-                    for pop in pops:
-                        print(f'--------Loading {category.replace("_table", "")} phenotypes for {pop.upper()}--------')
-                        pop_ht = ht.filter(ht[f'n_cases_{pop}'] >= 200)
-                        pop_ht = pop_ht.checkpoint(f'gs://aou_tmp/pheno_info/{pop}_{category}_n_cases_over_200.ht', _read_if_exists=True)
-                        pheno_lst = pop_ht.phenocode.collect()
-                        phenos_to_run_by_pop_by_group[pop][category] = pheno_lst
-                        phenos_to_run_by_pop[pop] = phenos_to_run_by_pop[pop] + pheno_lst
-                meta_pheno_lst = []
-                for pop in pops:
-                    meta_pheno_lst = meta_pheno_lst + phenos_to_run_by_pop[pop]
-                phenos_to_run_by_pop['meta'] = list(set(meta_pheno_lst))
-                print(f"META pheno length: {len(phenos_to_run_by_pop['meta'])}")
-
-                write_pickle_dict(output=get_phenotype_info_path(version="pheno_by_pop_by_group_dict", extension="dict"),
-                                  dict=phenos_to_run_by_pop_by_group)
-                write_pickle_dict(output=get_phenotype_info_path(version="pheno_by_pop_dict", extension="dict"),
-                                  dict=phenos_to_run_by_pop)
-
-            phenos_to_run_by_pop = read_pickle_dict(get_phenotype_info_path(version="pheno_by_pop_dict", extension="dict"))
-            phenos_to_run_by_pop_by_group = read_pickle_dict(get_phenotype_info_path(version="pheno_by_pop_by_group_dict", extension="dict"))
+                print(phenos_to_run_by_ancestry)
+        else: 
+            phenos_to_run_by_ancestry = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_by_ancestry_dict.dict')
+            phenos_to_run_by_ancestry_by_group = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_by_ancestry_by_group_dict.dict')
             print(f'----------Number of phenotypes per category per pop (filtered to n_cases >= 200): --------------')
-            print([f"{pop.upper()}-{category}: {len(phenos_to_run_by_pop_by_group[pop][category])}" for pop in pops for category in list(all_phenos_by_group.keys())])
-            print([f"{pop.upper()}: {len(phenos_to_run_by_pop[pop])}" for pop in pops])
+            print([f"{ancestry.upper()}-{category}: {len(phenos_to_run_by_ancestry_by_group[ancestry][category])}" for ancestry in ancestries for category in list(all_phenos_by_group.keys())])
+            print([f"{ancestry.upper()}: {len(phenos_to_run_by_ancestry[ancestry])}" for ancestry in ancestries])
     else:
-        phenos_to_run_by_pop = {}
-        for pop in POPS:
-            phenos_to_run_by_pop[pop] = None
-        phenos_to_run_by_pop_by_group = None
+        phenos_to_run_by_ancestry = {}
+        for ancestry in ancestries:
+            phenos_to_run_by_ancestry[ancestry] = None
+        phenos_to_run_by_ancestry_by_group = None
 
     backend = hb.ServiceBackend(
         billing_project="all-by-aou", remote_tmpdir=TMP_BUCKET
@@ -909,49 +1100,62 @@ def main(args):
 
     if args.export_phenos:
         b = hb.Batch(
-            name=f"aou_export_pheno_{args.pops}_{'test' if args.test or args.phenos is not None else 'all'}",
+            name=f"aou_export_pheno_{args.ancestries}_{'test' if args.test or args.phenos is not None else 'all'}",
             backend=backend,
             default_storage="500Mi",
             default_cpu=n_threads,
         )
-        phenotype_categories = ['lab_measurements'] # TODO: remove later after this
-        for category in phenotype_categories:
-            for pop in pops:
-                if category not in list(phenos_to_run_by_pop_by_group[pop].keys()): continue
-                phenos_to_export = phenos_to_run_by_pop_by_group[pop][category]
-                print(f"------------{pop.upper()} phenotype info: {len(phenos_to_export)} {category.replace('_table', '')} phenotypes------------")
-                if category == 'random_phenotypes' and not hfs.exists(get_raw_phenotype_path(name = category, parsed=True, extension=f'{pop}.ht')):
-                    pheno_ht = hl.import_table(
-                        get_random_phenotype_path(pop=pop),
-                        impute=True,
-                        types={"userId": hl.tstr},
-                    )
-                    pheno_ht = pheno_ht.annotate(person_id = pheno_ht["userId"])
-                    pheno_ht = pheno_ht.key_by('person_id')
-                    pheno_ht = pheno_ht.drop("userId")
-                    meta_ht = hl.read_table(get_sample_meta_path(annotation=True, extension='ht'))
-                    pca_ht = hl.read_table(get_pca_ht_path(pop='all', name=f'pruned_full_scores'))
-                    pheno_ht = pheno_ht.annotate(**meta_ht[pheno_ht.key])
-                    pheno_ht = pheno_ht.annotate(**pca_ht[pheno_ht.key])
-                    pheno_ht.checkpoint(get_raw_phenotype_path(name = category, parsed=True, extension=f'{pop}.ht'), _read_if_exists=True)
-                for phenoname in phenos_to_export:
-                    pheno_path = f'{get_aou_saige_utils_root(pop=pop, name="pheno_file")}/phenotype_{phenoname}.tsv'
+        
+        for ancestry in ancestries:
+            print(f'Processing {ancestry.upper()}...')
+            for category in PHENO_CATEGORIES:
+                print(f'Processing {category}...')
+                fields = basic_covariates
+                if category not in list(phenos_to_run_by_ancestry_by_group[ancestry].keys()): continue
+                phenos_to_export = phenos_to_run_by_ancestry_by_group[ancestry][category]
+                print(f"------------{ancestry.upper()} phenotype info: {len(phenos_to_export)} {category} phenotypes------------")
+                for phenoname in tqdm(phenos_to_export):
+                    if (not ancestry in phenoname) and (category in GATE_CATEGORIES):
+                        continue
+                    if category in GATE_CATEGORIES:
+                        if category == 'onset':
+                            fields = PC_fields + ['birth_year', 'TTE', 'secondEvent']
+                        else:
+                            fields = PC_fields + ['birth_year', 'TTE', 'secondEvent', 'age_at_first_event']
+                        if phenoname.endswith("_ALL"):
+                            fields = fields + ["sex"]
+                        fields = ",".join(fields)
+                    pheno_path = f'{ANALYSIS_BUCKET}/pheno_file/{ancestry.upper()}/phenotype_{phenoname}.tsv'
+                    print(pheno_path)
                     if (not hfs.exists(pheno_path)
                             or args.overwrite_pheno_data
                     ):
-                        j = b.new_python_job(f'export_phenotype_{phenoname}_for_{pop}',
-                                             attributes={"pop": pop, "phenotype": copy.deepcopy(phenoname), "category": category})
-                        j.image("hailgenetics/hail:0.2.127-py3.9")
-                        j.call(export_pheno,
-                               category=category,
-                               pheno_path=pheno_path,
-                               covariates=covariates,
-                               pop=pop,
-                               phenoname=phenoname,
-                               binary_traits=binary_traits,
-                               phenotype_categories_in_mt=phenotype_categories_in_mt,
-                               proportion_single_sex=proportion_single_sex
-                               )
+                        j = b.new_python_job(f'export_phenotype_{phenoname}_for_{ancestry}',
+                                             attributes={"ancestry": ancestry, "phenotype": copy.deepcopy(phenoname), "category": category})
+                        j.image("hailgenetics/hail:0.2.133-py3.11")
+                        if category not in GATE_CATEGORIES:
+                            j.memory('highmem')
+                            j.cpu(8) 
+                            j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 24g --executor-memory 24g pyspark-shell')    
+                            j.call(export_pheno,
+                            category=category,
+                            fields=fields,
+                            pheno_path=pheno_path,
+                            phenoname=phenoname,
+                            ancestry=ancestry.upper(),
+                            binary_traits=binary_traits,
+                            proportion_single_sex=proportion_single_sex,
+                            )
+                        else:
+                            j.call(export_pheno_gate,
+                            category=category,
+                            fields=fields,
+                            pheno_path=pheno_path,
+                            phenoname=phenoname,
+                            )
+
+                if args.test:
+                    break
         b.run()
 
     if args.run_pipeline:
@@ -960,43 +1164,49 @@ def main(args):
         print(f'Analysis type: {analysis_type}')
         print(f'Variant_type: {variant_type}')
         print(f"Docker image: {SAIGE_DOCKER_IMAGE}...")
+        RESULT_ROOT = f'{ANALYSIS_BUCKET}/{analysis_type}_results'
 
-        for pop in pops:
+        for ancestry in ancestries:
             if not args.skip_bgen or not args.skip_saige:
-                N_GENE_PER_GROUP = 40 if pop=='all' else N_GENE_PER_GROUP
-                size = CHUNK_SIZE[pop] if analysis_type == 'variant' else N_GENE_PER_GROUP
-                if not hfs.exists(
-                        get_saige_interval_path(analysis_type=analysis_type, chunk_size=size, extension='pickle')):
-                    interval_ht = hl.read_table(get_saige_interval_path(analysis_type=analysis_type, chunk_size=size))
+                N_GENE_PER_GROUP = 50 if ancestry=='all' else 100
+                size = CHUNK_SIZE[ancestry] if analysis_type == 'variant' else N_GENE_PER_GROUP
+                interval_ht_path = f'{DATA_PATH}/utils/intervals/aou_{analysis_type}_interval_size_{size}.ht'
+                if not hfs.exists(interval_ht_path.replace('ht', 'pickle')):
+                    interval_ht = hl.read_table(interval_ht_path)
                     interval_ht = interval_ht.filter(interval_ht.interval.start.contig != "chrM")
                     intervals = interval_ht.aggregate(hl.agg.collect(interval_ht.interval))
                     write_pickle_dict(
-                        get_saige_interval_path(analysis_type=analysis_type, chunk_size=size, extension='pickle'),
+                        interval_ht_path.replace('ht', 'pickle'),
                         intervals)
                 intervals = read_pickle_dict(
-                    get_saige_interval_path(analysis_type=analysis_type, chunk_size=size, extension='pickle'))
+                    interval_ht_path.replace('ht', 'pickle'))
                 print(intervals[0:3])
-                print(f'---------Number of intervals [{pop.upper()}]: {len(intervals)}---------')
+                print(f'---------Number of intervals [{ancestry.upper()}]: {len(intervals)}---------')   
             if args.category is not None:
                 category = args.category
                 if args.category == 'small':
-                    phenos_to_run = set(phenos_to_run_by_pop_by_group[pop]["lab_measurements"] + phenos_to_run_by_pop_by_group[pop]['random_phenotypes'] + \
-                                    phenos_to_run_by_pop_by_group[pop]['pfhh_survey_table']+ phenos_to_run_by_pop_by_group[pop]["processed_physical_measurement_table"])
+                    phenos_to_run = set(phenos_to_run_by_ancestry_by_group[ancestry]["lab_measurement"] + phenos_to_run_by_ancestry_by_group[ancestry]['random_pheno'] + \
+                                    phenos_to_run_by_ancestry_by_group[ancestry]['pfhh_survey_table']+ phenos_to_run_by_ancestry_by_group[ancestry]["physical_measurement"])
                 elif args.category == 'quantitative':
                     phenos_to_run = set(
-                        phenos_to_run_by_pop_by_group[pop]["lab_measurements"] + phenos_to_run_by_pop_by_group[pop][
-                            "processed_physical_measurement_table"])
+                        phenos_to_run_by_ancestry_by_group[ancestry]["lab_measurement"] + phenos_to_run_by_ancestry_by_group[ancestry]["physical_measurement"])
+                elif args.category == 'binary':
+                    phenos_to_run = set(
+                        phenos_to_run_by_ancestry_by_group[ancestry]["r_drug"] + phenos_to_run_by_ancestry_by_group[ancestry]["pfhh_survey_table"])
+                elif args.category == 'gate':
+                    phenos_to_run = set(
+                        phenos_to_run_by_ancestry_by_group[ancestry]["onset"] + phenos_to_run_by_ancestry_by_group[ancestry]["progression"])
                 else:
                     category = args.category
-                    phenos_to_run = phenos_to_run_by_pop_by_group[pop][category]
+                    phenos_to_run = phenos_to_run_by_ancestry_by_group[ancestry][category]
                 print(list(phenos_to_run)[0:5])
             else:
                 category = 'all'
-                phenos_to_run_by_pop['all'] = None
-                phenos_to_run = phenos_to_run_by_pop[pop]
+                phenos_to_run_by_ancestry['all'] = None
+                phenos_to_run = phenos_to_run_by_ancestry[ancestry.lower()]
 
             b = hb.Batch(
-                name=f"saige_{analysis_type}_aou_{pop}_{category.replace('_table', '')}",
+                name=f"saige_{analysis_type}_aou_{ancestry}",
                 backend=backend,
                 default_image=SAIGE_DOCKER_IMAGE,
                 default_storage="500Mi",
@@ -1007,7 +1217,7 @@ def main(args):
             relatedness_cutoff = "0.125"
             num_markers = 2000
             n_threads = 8
-            sparse_grm_root = f"{DATA_PATH}/utils/grm/aou_{pop}"
+            sparse_grm_root = f"{DATA_PATH}/utils/grm/aou_{ancestry}"
             sparse_grm_extension = f"_relatednessCutoff_{relatedness_cutoff}_{num_markers}_randomMarkersUsed.sparseGRM.mtx"
             sparse_grm = b.read_input_group(
                 **{ext: f"{sparse_grm_root}.{ext}"
@@ -1015,12 +1225,12 @@ def main(args):
             )
 
             overwrite_null_models = args.overwrite_null_models
-            null_model_dir = get_aou_saige_results_root(analysis_type=analysis_type, pop=pop, name ='null_glmm')
+            null_model_dir = f'{RESULT_ROOT}/null_glmm/{ancestry.upper()}'
             null_models_already_created = {}
             null_models = {}
             pheno_exports = {}
-            if phenos_to_run is not None:
-                print(f"------------{pop.upper()} {analysis_type} analysis null models: {len(phenos_to_run)} phenotypes------------")
+            if phenos_to_run is not None and not args.skip_any_null_models:
+                print(f"------------{ancestry.upper()} {analysis_type} analysis null models: {len(phenos_to_run)} phenotypes------------")
                 print(f'Null model directory: {null_model_dir}')
                 if (not overwrite_null_models) and hfs.exists(null_model_dir):
                     null_models_already_created = {
@@ -1032,9 +1242,27 @@ def main(args):
                     null_glmm_root = f"{null_model_dir}/phenotype_{phenoname}"
                     model_file_path = f"{null_glmm_root}.rda"
                     variance_ratio_file_path =  f"{null_glmm_root}.varianceRatio.txt"
-                    current_trait_type = 'binary' if phenoname in binary_traits else 'quantitative'
+                    current_trait_type = None
+                    if phenoname in gate_traits:
+                        if not ancestry in phenoname:
+                            continue
+                        current_trait_type = 'survival'
+                        covariates = PC_fields + ['birth_year']
+                        if not phenoname.startswith('Birth'):
+                            covariates = covariates + ['age_at_first_event']
+                        if phenoname.endswith('_ALL'):
+                            covariates = covariates + ['sex']
+                        covariates = ",".join(covariates)
+                    elif phenoname in quantitative_traits:
+                        current_trait_type = 'quantitative'
+                        covariates = basic_covariates
+                    elif phenoname in binary_traits:
+                        current_trait_type = 'binary'
+                        covariates = basic_covariates
+                    else:
+                        raise ValueError(f"Unknown trait type for {phenoname}")
 
-                    pheno_file = b.read_input(f'{get_aou_saige_utils_root(pop=pop, name="pheno_file")}/phenotype_{phenoname}.tsv')
+                    pheno_file = b.read_input(f'{ANALYSIS_BUCKET}/pheno_file/{ancestry.upper()}/phenotype_{phenoname}.tsv')
                     pheno_exports[phenoname] = pheno_file
 
                     if (
@@ -1047,16 +1275,16 @@ def main(args):
                     else:
                         if args.skip_any_null_models:
                             break
-                        print(f'Running null model for {pop.upper()} {phenoname} : {current_trait_type}')
+                        print(f'Running null model for {ancestry.upper()} {phenoname} : {current_trait_type}')
                         fit_null_task = fit_null_glmm(
                             b,
-                            pop=pop,
+                            ancestry=ancestry,
                             output_root=null_glmm_root,
                             phenoname=phenoname,
                             pheno_file=pheno_exports[phenoname],
                             trait_type=current_trait_type,
                             covariates=covariates,
-                            plink_file_root=get_aou_sites_for_grm_path(pop=pop, extension="plink", pruned=True),
+                            plink_file_root=f'{DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink',
                             docker_image=SAIGE_DOCKER_IMAGE,
                             variant_type=variant_type,
                             sparse_grm=sparse_grm,
@@ -1069,30 +1297,30 @@ def main(args):
                             non_pre_emptible=False
                         )
                         fit_null_task.attributes.update(
-                            {"phenotype": copy.deepcopy(phenoname)}
+                            {"phenotype": copy.deepcopy(phenoname),
+                            "analysis_type": copy.deepcopy(analysis_type),
+                            "trait_type": copy.deepcopy(current_trait_type)}
                         )
                         model_file = fit_null_task.null_glmm.rda
                         variance_ratio_file = fit_null_task.null_glmm[f"varianceRatio.txt"]
 
                     null_models[phenoname] = (model_file, variance_ratio_file)
-            else:
-                print('No phenotype loaded...')
+                else:
+                    print('No phenotype loaded...')
 
             if not args.skip_bgen or not args.skip_saige:
-                print(f"------------{pop.upper()} {analysis_type} analysis bgen files------------")
-                bgen_dir = get_aou_saige_results_root(analysis_type=analysis_type, pop=pop, name="bgen")
+                print(f"------------{ancestry.upper()} {analysis_type} analysis bgen files------------")
+                bgen_dir = f'{RESULT_ROOT}/bgen/{ancestry.upper()}'
                 print(f'bgen directory: {bgen_dir}')
                 overwrite_bgens = args.overwrite_bgens
                 bgens_already_created = {}
                 if not overwrite_bgens and hfs.exists(bgen_dir):
-                    bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir)}
-                factor = 3 if analysis_type=='variant' else 4
-                print(f'Found {int(len(bgens_already_created)/factor)} Bgens in directory...')
+                    bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".bgen")}
+                print(f'Found {len(bgens_already_created)} Bgens in directory...')
 
                 bgens = {}
                 if args.test:
                     intervals = [intervals[0]]
-
 
                 if args.hail_image is None:
                     image = hb.build_python_image(
@@ -1108,7 +1336,7 @@ def main(args):
                     bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
                     if (f"{bgen_root}.bgen" not in bgens_already_created) or args.overwrite_bgens:
                         bgen_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{str(interval)}_bgen_{pop}"
+                            name=f"{analysis_type}_analysis_export_{str(interval)}_bgen_{ancestry}"
                         )
 
                         bgen_task.image(image)
@@ -1117,7 +1345,7 @@ def main(args):
                         bgen_task.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 24g --executor-memory 24g pyspark-shell')
                         bgen_task.call(
                             export_bgen_from_mt,
-                            pop=pop,
+                            ancestry=ancestry,
                             analysis_type=analysis_type,
                             interval=interval,
                             output_dir=bgen_dir,
@@ -1126,31 +1354,34 @@ def main(args):
                             variant_ac_filter= args.variant_ac_filter,
                             variant_callrate_filter=args.callrate_filter,
                         )
-                        b.write_output(bgen_task.log_file, f'gs://aou_tmp/000_bgen_logs/{analysis_type}_analysis_export_{str(interval)}_bgen_{pop}.log')
-                        bgen_task.attributes["pop"] = pop
+                        b.write_output(bgen_task.log_file, f'gs://aou_tmp/000_bgen_logs/{analysis_type}_analysis_export_{str(interval)}_bgen_{ancestry}.log')
+                        bgen_task.attributes["ancestry"] = ancestry
                         bgen_task.attributes["analysis_type"] = analysis_type
 
                         bgen_index = index_bgen(b=b,
-                                                pop=pop,
+                                                ancestry=ancestry,
+                                                analysis_type=analysis_type,
                                                 bgen=f"{bgen_root}.bgen",
                                                 depend_job=bgen_task)
-                        bgen_index.attributes["pop"] = pop
+                        bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
-                    if ((f"{bgen_root}.gene.txt" not in bgens_already_created)  or args.overwrite_gene_txt)and analysis_type=='gene':
-                        gene_txt_task = b.new_python_job(
-                            name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{pop}"
-                        )
-                        gene_txt_task.image(HAIL_DOCKER_IMAGE)
-                        gene_txt_task.call(
-                            export_gene_group_file,
-                            interval=interval,
-                            pop=pop,
-                            output_dir=f"{bgen_root}.gene.txt",
-                        )
-                        gene_txt_task.attributes["pop"] = pop
+                    # TODO: add back once gene group files are ready
+                    # if ((f"{bgen_root}.gene.txt" not in bgens_already_created)  or args.overwrite_gene_txt)and analysis_type=='gene':
+                    #     gene_txt_task = b.new_python_job(
+                    #         name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
+                    #     )
+                    #     gene_txt_task.image(HAIL_DOCKER_IMAGE)
+                    #     gene_txt_task.call(
+                    #         export_gene_group_file,
+                    #         interval=interval,
+                    #         ancestry=ancestry,
+                    #         output_dir=f"{bgen_root}.gene.txt",
+                    #     )
+                    #     gene_txt_task.attributes["ancestry"] = ancestry
+                    #     gene_txt_task.attributes["analysis_type"] = analysis_type
                     if (not hfs.exists(f"{bgen_root}.bgen.bgi")) and  (hfs.exists(f"{bgen_root}.bgen")):
-                        bgen_index=index_bgen(b=b, pop=pop, bgen=f"{bgen_root}.bgen")
-                        bgen_index.attributes["pop"] = pop
+                        bgen_index=index_bgen(b=b, ancestry=ancestry, analysis_type=analysis_type, bgen=f"{bgen_root}.bgen")
+                        bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
 
 
@@ -1185,15 +1416,13 @@ def main(args):
                         bgens[str(interval)] = bgen_file
 
 
-            result_dir = get_aou_saige_results_root(
-                analysis_type=analysis_type, pop=pop, name="result"
-            )
+            result_dir = f'{RESULT_ROOT}/result/{ancestry.upper()}'
             print(f'result directory: {result_dir}')
             overwrite_results = args.overwrite_results
             saige_tasks = {}
             saige_ur_tasks = {}
             if not args.skip_saige:
-                memory = 'highmem' if pop in ['eur', 'all'] and analysis_type == 'variant' else 'standard'
+                memory = '10G' if ancestry in ['afr', 'eur', 'all'] and analysis_type == 'variant' else 'standard'
                 groups=None
                 if analysis_type == "gene":
                     if args.groups is None:
@@ -1201,10 +1430,18 @@ def main(args):
                     else:
                         groups = args.groups
                     print(f'Groups to run: {groups}')
-                print(f"------------{pop.upper()} {analysis_type} analysis step 2: {len(phenos_to_run)} phenotypes------------")
+                print(f"------------{ancestry.upper()} {analysis_type} analysis step 2: {len(phenos_to_run)} phenotypes------------")
                 for i in tqdm(range(len(phenos_to_run))):
                     phenoname = list(phenos_to_run)[i]
-                    current_trait_type = 'binary' if phenoname in binary_traits else 'quantitative'
+                    if phenoname in gate_traits:
+                        current_trait_type = 'survival'
+                    elif phenoname in quantitative_traits:
+                        current_trait_type = 'quantitative'
+                    elif phenoname in binary_traits:
+                        current_trait_type = 'binary'
+                    else:
+                        raise ValueError(f"Unknown trait type for {phenoname}")
+
                     saige_tasks[phenoname] = []
                     if analysis_type == 'gene':
                         saige_ur_tasks[phenoname] = []
@@ -1231,11 +1468,11 @@ def main(args):
                             and hfs.exists(pheno_results_dir) and analysis_type == 'gene'
                     ):
                         exome_results_already_created = {x["path"] for x in hl.hadoop_ls(pheno_results_dir) if
-                                                         x["path"].endswith('_exome.single_variant.txt')}
+                                                        x["path"].endswith('_exome.single_variant.txt')}
                         print(
-                            f'-------------- Found {int(len(exome_results_already_created))} exome results in [{pop}: {phenoname}] directory...')
+                            f'-------------- Found {int(len(exome_results_already_created))} exome results in [{ancestry}: {phenoname}] directory...')
                     factor = 2 if analysis_type == 'variant' else 5
-                    print(f'-------------- Found {int(len(results_already_created) / factor)} {analysis_type} results in [{pop}: {phenoname}] directory...')
+                    print(f'-------------- Found {int(len(results_already_created) / factor)} {analysis_type} results in [{ancestry}: {phenoname}] directory...')
 
                     for interval in intervals:
                         results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
@@ -1249,7 +1486,7 @@ def main(args):
                             sparse_grm_file = sparse_grm[sparse_grm_extension]
                         else:
                             bgen_file = bgens[str(interval)]
-                        samples_file = b.read_input(get_aou_sample_file_path(pop=pop))
+                        samples_file = b.read_input(f'{DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
 
                         if (
                             overwrite_results
@@ -1259,7 +1496,7 @@ def main(args):
                             saige_task = run_saige(
                                 p=b,
                                 phenoname=phenoname,
-                                pop=pop,
+                                ancestry=ancestry,
                                 output_root=results_path,
                                 model_file=model_file,
                                 variance_ratio_file=variance_ratio_file,
@@ -1279,7 +1516,7 @@ def main(args):
                                 memory=memory
                             )
                             saige_task.attributes.update(
-                                {"interval": str(interval), "pop": pop, 'name': f'saige{analysis_type == "gene"}'}
+                                {"interval": str(interval), "ancestry": ancestry, 'name': f'saige{analysis_type == "gene"}'}
                             )
                             saige_task.attributes.update(
                                 {"phenotype": copy.deepcopy(phenoname)}
@@ -1291,11 +1528,11 @@ def main(args):
                                     args.overwrite_exome_results
                                     or (f"{results_path}_exome.single_variant.txt" not in exome_results_already_created)
                             ):
-                                memory = 'highmem' if pop in ['eur', 'all']  else 'standard'
+                                memory = 'highmem' if ancestry in ['eur', 'all']  else 'standard'
                                 saige_ur_task = run_saige(
                                     p=b,
                                     phenoname=phenoname,
-                                    pop=pop,
+                                    ancestry=ancestry,
                                     output_root=f'{results_path}_exome',
                                     model_file=model_file,
                                     variance_ratio_file=variance_ratio_file,
@@ -1315,7 +1552,7 @@ def main(args):
                                     variant_type=variant_type,
                                 )
                                 saige_ur_task.attributes.update(
-                                    {"interval": str(interval), "pop": pop}
+                                    {"interval": str(interval), "ancestry": ancestry}
                                 )
                                 saige_ur_task.attributes.update(
                                     {"phenotype": copy.deepcopy(phenoname)}
@@ -1325,16 +1562,16 @@ def main(args):
                         break
 
             if not args.skip_load_hail_results:
-                test_type = 'saige' if analysis_type == 'variant' else 'saige_gene'
-                root = f'{RESULTS_PATH}/{test_type}_results/{pop.upper()}'
-                print(f'--------------Loading results from {analysis_type} analysis [{pop.upper()}]: {root}------------')
+                results_type = 'ACAF' if analysis_type == 'variant' else 'Exome'
+                root = f'{ANALYSIS_BUCKET}/ht_results/{ancestry.upper()}'
+                print(f'--------------Loading results from {results_type} analysis [{ancestry.upper()}]: {root}------------')
                 for i in tqdm(range(len(phenos_to_run))):
                     phenoname = list(phenos_to_run)[i]
-                    directory = f'{get_aou_saige_results_root(analysis_type=analysis_type, pop=pop, name="result")}/phenotype_{phenoname}'
-                    output_ht_directory = f'{root}/phenotype_{phenoname}'
-                    if (hfs.exists(f'{output_ht_directory}/variant_results.ht/_SUCCESS') and not args.overwrite_hail_results):
+                    if phenoname in gate_traits and not ancestry in phenoname:
                         continue
-                    null_glmm_log = f'{get_aou_saige_results_root(analysis_type=analysis_type, pop=pop, name ="null_glmm")}/phenotype_{phenoname}.log'
+                    directory = f'{ANALYSIS_BUCKET}/{analysis_type}_results/result/{ancestry.upper()}/phenotype_{phenoname}'
+                    output_ht_directory = f'{root}/phenotype_{phenoname}'
+                    null_glmm_log = f'{ANALYSIS_BUCKET}/{analysis_type}_results/null_glmm/{ancestry.upper()}/phenotype_{phenoname}.log'
 
                     saige_log = f'{directory}/result_{phenoname}_chr1_{"000065419" if analysis_type == "gene" else "000000001"}.{analysis_type}.log'
 
@@ -1342,25 +1579,24 @@ def main(args):
 
                     if not args.skip_load_gene_results and analysis_type == 'gene':
                         if (not hfs.exists(f'{output_ht_directory}/gene_results.ht/_SUCCESS')) or args.overwrite_hail_results:
-                            print(f'[{pop.upper()}: {phenoname}] Gene table')
+                            print(f'[{ancestry.upper()}: {phenoname}] Gene table')
                             j = b.new_python_job(
-                                name=f'sync_saige_{analysis_type}_gene_HT_{phenoname}_{pop}',
-                                attributes={"analysis_type": analysis_type, "pop": pop,
+                                name=f'sync_saige_{analysis_type}_gene_HT_{phenoname}_{ancestry}',
+                                attributes={"analysis_type": analysis_type, "ancestry": ancestry,
                                             "phenotype": copy.deepcopy(phenoname)})
-                            j.image("hailgenetics/hail:0.2.127-py3.9")
+                            j.image("hailgenetics/hail:0.2.133-py3.11")
                             j.memory('standard')
                             j.cpu(16)
                             j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 8g --executor-memory 8g pyspark-shell')
-                            gene_SUCCESS = hfs.exists(f'{output_ht_directory}/gene_results.ht/_SUCCESS')
                             j.call(load_gene_data,
                                    directory=directory,
                                    output_ht_directory=output_ht_directory,
                                    phenoname=phenoname,
-                                   gene_ht_map_path=get_aou_gene_map_ht_path(pop=pop, processed=False),
+                                   gene_ht_map_path=get_aou_gene_map_ht_path(pop=ancestry, processed=False),
                                    quantitative_trait=quantitative_trait,
                                    null_glmm_log=null_glmm_log,
                                    saige_log=saige_log,
-                                   overwrite=args.overwrite_hail_results or not gene_SUCCESS
+                                   overwrite=True
                                    )
                             if phenoname in list(saige_tasks.keys()) and not args.skip_saige:
                                 j.depends_on(*saige_tasks[phenoname])
@@ -1370,22 +1606,21 @@ def main(args):
                         extension = 'single_variant.txt'
                         variant_type = 'genome' if analysis_type == 'variant' else 'exome'
                         j = b.new_python_job(
-                            name=f'sync_saige_{variant_type}_variant_HT_{phenoname}_{pop}',
-                            attributes={"analysis_type": analysis_type, "pop": pop, "phenotype": copy.deepcopy(phenoname)})
-                        j.image("hailgenetics/hail:0.2.127-py3.9")
-                        j.memory('standard')
+                            name=f'sync_saige_{variant_type}_variant_HT_{phenoname}_{ancestry}',
+                            attributes={"analysis_type": analysis_type, "ancestry": ancestry, "phenotype": copy.deepcopy(phenoname)})
+                        j.image("hailgenetics/hail:0.2.133-py3.11")
+                        j.memory('highmem')
                         j.cpu(16)
-                        j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 8g --executor-memory 8g pyspark-shell')
-                        SUCCESS = hfs.exists(f'{output_ht_directory}/variant_results.ht/_SUCCESS')
+                        j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 16g --executor-memory 16g pyspark-shell')
+                        SUCCESS = hfs.exists(f'{output_ht_directory}/{variant_type}_variant_results.ht/_SUCCESS')
 
-                        print(f'[{pop.upper()}: {phenoname}] {variant_type} variant table')
+                        print(f'[{ancestry.upper()}: {phenoname}] {variant_type} variant table')
                         j.call(load_variant_data,
                                    directory=directory,
                                    output_ht_directory=output_ht_directory,
                                    phenoname=phenoname,
                                    quantitative_trait=quantitative_trait,
                                    null_glmm_log=null_glmm_log,
-                                   saige_log=saige_log,
                                    extension=extension,
                                    overwrite=args.overwrite_hail_results or not SUCCESS,
                                    variant_type = variant_type
@@ -1494,7 +1729,7 @@ if __name__ == "__main__":
         default="pLoF,missenseLC,synonymous,pLoF:missenseLC",
     )
     parser.add_argument(
-        "--pops", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
+        "--ancestries", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
     )
     parser.add_argument(
         "--pilot", help="Run pilot phenotypes only", action="store_true"
@@ -1505,7 +1740,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-hail-image", help="hail docker image to use", action="store_true",
         # default='us-central1-docker.pkg.dev/broad-mpg-gnomad/images/vrs084'
-        default ='hailgenetics/hail:0.2.130-py3.9'
+        default ='hailgenetics/hail:0.2.133-py3.11'
     )
     parser.add_argument(
         "--callrate-filter",
