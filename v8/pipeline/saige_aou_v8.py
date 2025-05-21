@@ -858,8 +858,9 @@ def export_bgen_from_mt(
     print(hl.utils.range_table(10)._force_count())
 
 
-def export_gene_group_file(interval, pop, output_dir):
-    gene_ht = hl.read_table(get_aou_gene_map_ht_path(pop=pop, processed=True))
+def export_gene_group_file(interval, ancestry, output_dir):
+    gene_ht_path = f'{DATA_PATH}/utils/gene_map/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
+    gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
     var_ht = gene_ht.select(gene=hl.if_else(hl.is_missing(gene_ht.gene_id), '_', gene_ht.gene_id) + '_' + hl.if_else(hl.is_missing(gene_ht.gene_symbol), '_', gene_ht.gene_symbol),
                             tag='var',
@@ -1365,20 +1366,19 @@ def main(args):
                                                 depend_job=bgen_task)
                         bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
-                    # TODO: add back once gene group files are ready
-                    # if ((f"{bgen_root}.gene.txt" not in bgens_already_created)  or args.overwrite_gene_txt)and analysis_type=='gene':
-                    #     gene_txt_task = b.new_python_job(
-                    #         name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
-                    #     )
-                    #     gene_txt_task.image(HAIL_DOCKER_IMAGE)
-                    #     gene_txt_task.call(
-                    #         export_gene_group_file,
-                    #         interval=interval,
-                    #         ancestry=ancestry,
-                    #         output_dir=f"{bgen_root}.gene.txt",
-                    #     )
-                    #     gene_txt_task.attributes["ancestry"] = ancestry
-                    #     gene_txt_task.attributes["analysis_type"] = analysis_type
+                    if ((f"{bgen_root}.gene.txt" not in bgens_already_created)  or args.overwrite_gene_txt)and analysis_type=='gene':
+                        gene_txt_task = b.new_python_job(
+                            name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
+                        )
+                        gene_txt_task.image(HAIL_DOCKER_IMAGE)
+                        gene_txt_task.call(
+                            export_gene_group_file,
+                            interval=interval,
+                            ancestry=ancestry,
+                            output_dir=f"{bgen_root}.gene.txt",
+                        )
+                        gene_txt_task.attributes["ancestry"] = ancestry
+                        gene_txt_task.attributes["analysis_type"] = analysis_type
                     if (not hfs.exists(f"{bgen_root}.bgen.bgi")) and  (hfs.exists(f"{bgen_root}.bgen")):
                         bgen_index=index_bgen(b=b, ancestry=ancestry, analysis_type=analysis_type, bgen=f"{bgen_root}.bgen")
                         bgen_index.attributes["ancestry"] = ancestry
