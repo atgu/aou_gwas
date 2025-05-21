@@ -110,9 +110,9 @@ def create_raw_gene_map(pop: str, overwrite: bool = False, batch_mode=False):
     # Load VEP table
     snp_indel_vep_path = SNPINDEL_OUT_PATH
     try:
-        vep_ht = hl.read_table(snp_indel_vep_path)
-        print(vep_ht.count())
-        vep_ht.show()
+        snp_indel_vep_ht = hl.read_table(snp_indel_vep_path)
+        print(snp_indel_vep_ht.count())
+        snp_indel_vep_ht.show()
     except:
         pass
         
