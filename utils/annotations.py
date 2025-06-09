@@ -22,8 +22,9 @@ OTHER_CSQS = ["mature_miRNA_variant", "5_prime_UTR_variant",
 # TODO: question, "missense-damaging" vs "damaging_missense"
 
 
-def annotation_case_builder(worst_csq_by_gene_canonical_expr, use_loftee: bool = True, use_polyphen_and_sift: bool = False,
+def annotation_case_builder(ht, use_loftee: bool = True, use_polyphen_and_sift: bool = False,
                             strict_definitions: bool = False):
+    worst_csq_by_gene_canonical_expr = ht.vep.worst_csq_by_gene_canonical
     case = hl.case(missing_false=True)
     if use_loftee:
         case = (case
@@ -50,6 +51,39 @@ def annotation_case_builder(worst_csq_by_gene_canonical_expr, use_loftee: bool =
     return case.or_missing()
 
 
+# def brava_annot_case_builder(ht):
+#     consequences = ht.vep.worst_csq_by_gene_canonical.most_severe_consequence
+#     case = hl.case(missing_false=True)
+#     case = (case
+#             .when(ht.LOF == 'HC', 'pLoF')
+#             .when((hl.literal(MISSENSE_CSQS).contains(consequences) & (
+#                         (ht.REVEL_SCORE >= 0.773) | (ht.CADD_PHRED >= 28.1))) |
+#                 (ht.splice_ai_ds >= 0.2) |
+#                 (ht.LOF == 'LC'), 'missense')
+#             .when(hl.literal(MISSENSE_CSQS).contains(consequences),
+#                 'other_missense')
+#             .when((consequences == 'synonymous_variant') & (ht.splice_ai_ds < 0.2),
+#                 'synonymous')
+#             .or_missing())
+#     return case
+def brava_annot_case_builder(ht):
+    bravavep_annot = ht.values
+    vat_annot = ht.aou_vat_annot
+    consequences = ht.values.worst_csq_by_gene_canonical.most_severe_consequence
+    case = hl.case(missing_false=True)
+    case = (case
+            .when(bravavep_annot.LOF == 'HC', 'pLoF')
+            .when((hl.literal(MISSENSE_CSQS).contains(consequences) & (
+                        (bravavep_annot.REVEL_SCORE >= 0.773) | (bravavep_annot.CADD_PHRED >= 28.1))) |
+                # (vat_annot.splice_ai_ds >= 0.2) |
+                (bravavep_annot.LOF == 'LC'), 'missense')
+            .when(hl.literal(MISSENSE_CSQS).contains(consequences),
+                'other_missense')
+            .when((consequences == 'synonymous_variant') & (vat_annot.splice_ai_ds < 0.2),
+                'synonymous')
+            .or_missing())
+    return case
+
 def annotation_case_builder_ukb_legacy(worst_csq_by_gene_canonical_expr):
     return (hl.case(missing_false=True)
             .when(worst_csq_by_gene_canonical_expr.lof == 'HC', 'pLoF')
@@ -62,20 +96,34 @@ def annotation_case_builder_ukb_legacy(worst_csq_by_gene_canonical_expr):
             .or_missing())
 
 
-def create_gene_map_ht(snpindel_ht, check_gene_contigs=False, freq_field=None):
-    from gnomad.utils.vep import process_consequences
-    
-    def format_vep_ht(ht, freq_field, check_gene_contigs):
+def create_gene_map_ht(snpindel_ht, annot_type, freq_field=None, check_gene_contigs=False):
+
+    def format_ht(ht, annot, freq_field,  check_gene_contigs):
         fields = ['variant_id', 'gene_id', 'gene_symbol', 'annotation']
         if freq_field is not None:
             ht = ht.annotate(_af=ht[freq_field])
             fields.append('_af')
-        ht = process_consequences(ht)
-        ht = ht.explode(ht.vep.worst_csq_by_gene_canonical)
-        ht = ht.filter(ht.vep.worst_csq_by_gene_canonical.gene_id.startswith('ENSG'))
-        ht = ht.annotate(
-            variant_id=ht.locus.contig + ':' + hl.str(ht.locus.position) + ':' + ht.alleles[0] + ':' + ht.alleles[1],
-            annotation=annotation_case_builder(ht.vep.worst_csq_by_gene_canonical))
+        
+        if annot == 'snp_indel':
+            ht = ht.explode(ht.worst_csq_by_gene_canonical)
+            ht = ht.filter(ht.worst_csq_by_gene_canonical.gene_id.startswith('ENSG'))
+            ht = ht.annotate(
+                variant_id=ht.locus.contig + ':' + hl.str(ht.locus.position) + ':' + ht.alleles[0] + ':' + ht.alleles[1],
+                annotation=annotation_case_builder(ht))
+        elif annot == 'brava':
+            ht = ht.explode(ht.values)
+            ht = ht.filter(ht.values.worst_csq_by_gene_canonical.gene_id.startswith('ENSG'))
+            ht = ht.annotate(
+            aou_vat_annot=ht.aou_vat_annot.annotate(
+                splice_ai_ds=hl.max(
+                    ht.aou_vat_annot.splice_ai_acceptor_gain_score,
+                    ht.aou_vat_annot.splice_ai_acceptor_loss_score,
+                    ht.aou_vat_annot.splice_ai_donor_gain_score,
+                    ht.aou_vat_annot.splice_ai_donor_loss_score)))
+            ht = ht.annotate(
+                variant_id=ht.locus.contig + ':' + hl.str(ht.locus.position) + ':' + ht.alleles[0] + ':' + ht.alleles[1],
+                annotation=brava_annot_case_builder(ht))
+            
         if check_gene_contigs:
             gene_contigs = ht.group_by(
                 gene_id=ht.vep.worst_csq_by_gene_canonical.gene_id,
@@ -84,13 +132,14 @@ def create_gene_map_ht(snpindel_ht, check_gene_contigs=False, freq_field=None):
                 contigs=hl.agg.collect_as_set(ht.locus.contig)
             )
             assert gene_contigs.all(hl.len(gene_contigs.contigs) == 1)
-        ht = ht.annotate(gene_id=ht.vep.worst_csq_by_gene_canonical.gene_id,
-                         gene_symbol=ht.vep.worst_csq_by_gene_canonical.gene_symbol)
+        
+        ht = ht.annotate(gene_id=ht.values.worst_csq_by_gene_canonical.gene_id,
+                         gene_symbol=ht.values.worst_csq_by_gene_canonical.gene_symbol)
         ht = ht.select(**{field: ht[field] for field in fields})
         
         return ht
 
-    snpindel_ht = format_vep_ht(snpindel_ht, freq_field, check_gene_contigs)
+    snpindel_ht = format_ht(snpindel_ht, annot_type, freq_field, check_gene_contigs)
     
     collect_field = (snpindel_ht.variant_id, snpindel_ht._af) if freq_field is not None else snpindel_ht.variant_id
     gene_map_ht = snpindel_ht.group_by(
@@ -166,14 +215,16 @@ def create_tmp_gene_map_ht(ht, check_gene_contigs=False, freq_field=None):
 
 def post_process_gene_map_ht(gene_ht, freq_cutoff):
     print(f'Frequency cutoff: {freq_cutoff}')
-    groups = ['pLoF', 'missense|LC', 'synonymous']
-    variant_groups = hl.map(lambda group: group.split('\\|').flatmap(lambda csq: gene_ht.variants.get(csq)), groups)
+    # original_groups = ['pLoF', 'missense', 'synonymous', 'other_missense', 'missense-other_missense'] # TODO - This option needs so downstream work
+    group_names = ['pLoF', 'missense', 'synonymous', 'other_missense']
+    variant_groups = hl.map(lambda group: group.split('\\-').flatmap(lambda csq: gene_ht.variants.get(csq)), group_names)
     gene_ht = gene_ht.transmute(
-        variant_groups=hl.zip(groups, variant_groups)
+        variant_groups=hl.zip(group_names, variant_groups)
     ).explode('variant_groups')
-    gene_ht = gene_ht.transmute(annotation=gene_ht.variant_groups[0],
-                                variants=hl.sorted(gene_ht.variant_groups[1]))
-
+    gene_ht = gene_ht.transmute(
+        annotation=gene_ht.variant_groups[0],
+        variants=hl.sorted(gene_ht.variant_groups[1])
+    )
     common_variants: hl.expr.ArrayExpression = gene_ht.variants.filter(lambda x: x[1] >= freq_cutoff)
     rare_variants = gene_ht.variants.filter(lambda x: x[1] < freq_cutoff)
     variants = common_variants.map(lambda x: (gene_ht.annotation, True, [x])).append((gene_ht.annotation, False, rare_variants))

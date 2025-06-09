@@ -1314,10 +1314,16 @@ def main(args):
                 bgen_dir = f'{RESULT_ROOT}/bgen/{ancestry.upper()}'
                 print(f'bgen directory: {bgen_dir}')
                 overwrite_bgens = args.overwrite_bgens
+                overwrite_groupfile = args.overwrite_gene_txt
                 bgens_already_created = {}
+                groupfile_already_created = {}
+                
                 if not overwrite_bgens and hfs.exists(bgen_dir):
                     bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".bgen")}
                 print(f'Found {len(bgens_already_created)} Bgens in directory...')
+                if not overwrite_groupfile and hfs.exists(bgen_dir):
+                    groupfile_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".txt")}
+                print(f'Found {len(groupfile_already_created)} groupFiles in directory...')
 
                 bgens = {}
                 if args.test:
@@ -1366,7 +1372,7 @@ def main(args):
                                                 depend_job=bgen_task)
                         bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
-                    if ((f"{bgen_root}.gene.txt" not in bgens_already_created)  or args.overwrite_gene_txt)and analysis_type=='gene':
+                    if ((f"{bgen_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
                         gene_txt_task = b.new_python_job(
                             name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
                         )
