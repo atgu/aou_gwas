@@ -99,7 +99,7 @@ def annotation_case_builder_ukb_legacy(worst_csq_by_gene_canonical_expr):
 def create_gene_map_ht(snpindel_ht, annot_type, freq_field=None, check_gene_contigs=False):
 
     def format_ht(ht, annot, freq_field,  check_gene_contigs):
-        fields = ['variant_id', 'gene_id', 'gene_symbol', 'annotation']
+        fields = ['variant_id', 'gene_id', 'gene_symbol', 'annotation', 'vsm_weights']
         if freq_field is not None:
             ht = ht.annotate(_af=ht[freq_field])
             fields.append('_af')
@@ -141,7 +141,7 @@ def create_gene_map_ht(snpindel_ht, annot_type, freq_field=None, check_gene_cont
 
     snpindel_ht = format_ht(snpindel_ht, annot_type, freq_field, check_gene_contigs)
     
-    collect_field = (snpindel_ht.variant_id, snpindel_ht._af) if freq_field is not None else snpindel_ht.variant_id
+    collect_field = (snpindel_ht.variant_id, snpindel_ht._af, snpindel_ht.vsm_weights) if freq_field is not None else (snpindel_ht.variant_id, snpindel_ht.vsm_weights)
     gene_map_ht = snpindel_ht.group_by(
         gene_id=snpindel_ht.gene_id,
         gene_symbol=snpindel_ht.gene_symbol,
@@ -229,9 +229,20 @@ def post_process_gene_map_ht(gene_ht, freq_cutoff):
     rare_variants = gene_ht.variants.filter(lambda x: x[1] < freq_cutoff)
     variants = common_variants.map(lambda x: (gene_ht.annotation, True, [x])).append((gene_ht.annotation, False, rare_variants))
     gene_ht = gene_ht.select('interval', variants=variants).explode('variants')
-    gene_ht = gene_ht.transmute(annotation=gene_ht.variants[0], common_variant=gene_ht.variants[1], variants=hl.sorted(gene_ht.variants[2].map(lambda x: x[0])))
+    # gene_ht = gene_ht.transmute(annotation=gene_ht.variants[0], common_variant=gene_ht.variants[1], variants=hl.sorted(gene_ht.variants[2].map(lambda x: x[0])))
+    gene_ht = gene_ht.transmute(annotation=gene_ht.variants[0], 
+                            common_variant=gene_ht.variants[1], 
+                            variants=hl.sorted(gene_ht.variants[2].map(lambda x: x[0])),
+                            weights=gene_ht.variants[2].map(lambda x: x[2])) 
+    gene_ht = gene_ht.annotate(
+        weights = hl.if_else(
+            hl.is_defined(gene_ht.weights) & (hl.len(gene_ht.weights) > 0),
+            gene_ht.weights[0],
+            hl.missing(gene_ht['weights'].dtype.element_type)
+        )
+    )
     gene_ht = gene_ht.filter(~gene_ht.common_variant)
-    gene_ht = gene_ht.annotate(annotation = hl.if_else(gene_ht.annotation.matches('\\|'), gene_ht.annotation.replace('\\|', ''), gene_ht.annotation))
+    # gene_ht = gene_ht.annotate(annotation = hl.if_else(gene_ht.annotation.matches('\\|'), gene_ht.annotation.replace('\\|', ''), gene_ht.annotation))
     gene_ht = gene_ht.annotate(annotation = (gene_ht.annotation+' ')*hl.len(gene_ht.variants))
     gene_ht = gene_ht.key_by(start=gene_ht.interval.start)
     return gene_ht.filter(hl.len(gene_ht.variants) > 0)
