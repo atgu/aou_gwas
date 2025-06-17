@@ -858,25 +858,71 @@ def export_bgen_from_mt(
     print(hl.utils.range_table(10)._force_count())
 
 
-def export_gene_group_file(interval, ancestry, output_dir):
+def export_gene_group_file(interval, ancestry, output_dir, weight_saige_gene = None):
     gene_ht_path = f'{DATA_PATH}/utils/gene_map/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
     gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
-    var_ht = gene_ht.select(gene=hl.if_else(hl.is_missing(gene_ht.gene_id), '_', gene_ht.gene_id) + '_' + hl.if_else(hl.is_missing(gene_ht.gene_symbol), '_', gene_ht.gene_symbol),
-                            tag='var',
-                            info=hl.delimit(gene_ht.variants, " ")
-                            ).add_index().key_by().drop("start")
-    anno_ht = gene_ht.select(gene=hl.if_else(hl.is_missing(gene_ht.gene_id), '_', gene_ht.gene_id) + '_' + hl.if_else(hl.is_missing(gene_ht.gene_symbol), '_', gene_ht.gene_symbol),
-                             tag='anno',
-                             info=gene_ht.annotation[:-1]
-                             ).add_index().key_by().drop("start")
-    group_ht = var_ht.union(anno_ht)
-    group_ht = group_ht.group_by('gene', 'tag').aggregate(info = hl.agg.collect(group_ht.info))
-    group_ht = group_ht.annotate(info  = hl.str(' ').join(group_ht.info))
-    group_ht = group_ht.order_by(group_ht.gene, hl.desc(group_ht.tag))
+    
+    if weight_saige_gene is None:
+        processed_gene_ht = gene_ht        
+        var_ht = processed_gene_ht.select(
+            gene=hl.if_else(hl.is_missing(processed_gene_ht.gene_id), '_', processed_gene_ht.gene_id) + '_' + 
+                 hl.if_else(hl.is_missing(processed_gene_ht.gene_symbol), '_', processed_gene_ht.gene_symbol),
+            tag='var',
+            info=hl.delimit(processed_gene_ht.variants, " ")
+        ).annotate(idx=1).key_by().drop("start")
+        anno_ht = processed_gene_ht.select(
+            gene=hl.if_else(hl.is_missing(processed_gene_ht.gene_id), '_', processed_gene_ht.gene_id) + '_' + 
+                 hl.if_else(hl.is_missing(processed_gene_ht.gene_symbol), '_', processed_gene_ht.gene_symbol),
+            tag='anno',
+            info=processed_gene_ht.annotation
+        ).annotate(idx=2).key_by().drop("start")
+
+        group_ht = var_ht.union(anno_ht)
+        
+    else:
+        null_weight_mask = gene_ht.weights.map(lambda w: hl.is_missing(w[weight_saige_gene]) | hl.is_nan(w[weight_saige_gene]))
+        filtered_gene_ht = gene_ht.annotate(
+            variants_filtered = hl.zip(gene_ht.variants, null_weight_mask).filter(lambda x: ~x[1]).map(lambda x: x[0]),
+            annotation_filtered = hl.delimit(
+                hl.zip(gene_ht.annotation.split(' '), null_weight_mask)
+                .filter(lambda x: ~x[1])
+                .map(lambda x: x[0]), 
+                ' '
+            ),
+            weights_filtered = hl.zip(gene_ht.weights, null_weight_mask).filter(lambda x: ~x[1]).map(lambda x: x[0])
+        )
+        
+        var_ht = filtered_gene_ht.select(
+            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
+                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
+            tag='var',
+            info=hl.delimit(filtered_gene_ht.variants_filtered, " ")
+        ).annotate(idx=1).key_by().drop("start")
+
+        anno_ht = filtered_gene_ht.select(
+            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
+                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
+            tag='anno',
+            info=filtered_gene_ht.annotation_filtered
+        ).annotate(idx=2).key_by().drop("start")
+        
+        weight_ht = filtered_gene_ht.select(
+            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
+                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
+            tag='weight',
+            info=hl.delimit(filtered_gene_ht.weights_filtered.map(lambda w: hl.str(w[weight_saige_gene])), " ")
+        ).annotate(idx=3).key_by().drop("start")
+
+        group_ht = var_ht.union(anno_ht).union(weight_ht)
+    
+    group_ht = group_ht.group_by('gene', 'tag', 'idx').aggregate(info = hl.agg.collect(group_ht.info))
+    group_ht = group_ht.annotate(info = hl.str(' ').join(group_ht.info))
+    group_ht = group_ht.order_by(group_ht.gene, group_ht.idx).drop('idx')
     group_ht.show()
-    # group_ht = group_ht.order_by('idx').drop('idx')
     group_ht.export(output_dir, header=False, delimiter=' ')
+    print("DATA EXPORTED")
+
 
 def index_bgen(b: hb.batch.Batch, ancestry:str, analysis_type:str, bgen: str, depend_job=None):
     file = b.read_input(bgen)
@@ -1377,11 +1423,14 @@ def main(args):
                             name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
                         )
                         gene_txt_task.image(HAIL_DOCKER_IMAGE)
+                        
+                        
                         gene_txt_task.call(
                             export_gene_group_file,
                             interval=interval,
                             ancestry=ancestry,
                             output_dir=f"{bgen_root}.gene.txt",
+                            weight_saige_gene = args.weight_saige_gene
                         )
                         gene_txt_task.attributes["ancestry"] = ancestry
                         gene_txt_task.attributes["analysis_type"] = analysis_type
@@ -1734,6 +1783,12 @@ if __name__ == "__main__":
         help="Comma-separated list of functional groups used for gene-based test ",
         default="pLoF,missenseLC,synonymous,pLoF:missenseLC",
     )
+    parser.add_argument(
+        "--weight-saige-gene",
+        help="Comma-separated list of VSMs used for variant weighting in gene-based test ",
+        default=None,
+    )
+    
     parser.add_argument(
         "--ancestries", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
     )
