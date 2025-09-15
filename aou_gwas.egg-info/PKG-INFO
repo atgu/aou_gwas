@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: aou_gwas
+Version: 0.0.1
+Requires-Dist: google-cloud-storage
+Requires-Dist: gnomad
+Requires-Dist: hail
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: tqdm
+Dynamic: requires-dist

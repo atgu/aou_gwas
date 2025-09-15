@@ -22,7 +22,7 @@ def get_top_p_from_mt(mt, p, return_ht = True):
 
 
 def get_vep_formatted_data(vep_path: str, legacy_annotations: bool = False):
-    from utils.annotations import annotation_case_builder, annotation_case_builder_ukb_legacy
+    from aou_gwas.utils.annotations import annotation_case_builder, annotation_case_builder_ukb_legacy
     from gnomad.utils.vep import process_consequences
     ht = hl.read_table(vep_path)
     ht = process_consequences(ht)

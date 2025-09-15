@@ -1,6 +1,6 @@
 import hail as hl
 import pandas as pd
-from .resources import *
+from aou_gwas.utils.resources import *
 from typing import Union
 import hailtop.fs as hfs
 import pickle

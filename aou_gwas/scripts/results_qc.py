@@ -16,9 +16,7 @@ import time
 from tqdm import tqdm
 
 from aou_gwas import *  # for dataproc
-# from utils.utils import *  # for QoB
-# from utils.resources import *  # for QoB
-# from utils.results_loading import * # for QoB
+
 
 def get_AF_bins(field):
     bins = (hl.case()

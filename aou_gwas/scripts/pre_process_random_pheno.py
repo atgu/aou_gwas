@@ -2,9 +2,8 @@
 
 __author__ = "wlu"
 
-# from aou_gwas import *  # for dataproc
-from utils.utils import *  # for QoB
-from utils.resources import *  # for QoB
+from aou_gwas.utils.utils import *  # for QoB
+from aou_gwas.utils.resources import *  # for QoB
 import hail as hl
 import argparse
 import hailtop.batch as hb

@@ -20,6 +20,7 @@ import time
 from typing import *
 from tqdm import tqdm
 import warnings
+from aou_gwas.utils.resources import get_aou_gene_map_ht_path
 
 def range_table(log_file):
     import hail as hl

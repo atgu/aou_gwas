@@ -20,9 +20,9 @@ import time
 from tqdm import tqdm
 
 # from aou_gwas import *  # for dataproc
-from utils.utils import *  # for QoB
-from utils.resources import *  # for QoB
-from utils.results_loading import * # for QoB
+from aou_gwas.utils.utils import *  # for QoB
+from aou_gwas.utils.resources import *  # for QoB
+from aou_gwas.utils.results_loading import * # for QoB
 
 def range_table(log_file):
     import hail as hl
