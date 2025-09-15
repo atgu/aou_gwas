@@ -4,9 +4,8 @@ __author__ = "wlu"
 
 import sys
 print(sys.path)
-# from aou_gwas import *  # for dataproc
-from utils.utils import *  # for QoB
-from utils.resources import *  # for QoB
+from aou_gwas.utils.utils import *  # for QoB
+from aou_gwas.utils.resources import *  # for QoB
 import hailtop.batch as hb
 import argparse
 import hail as hl

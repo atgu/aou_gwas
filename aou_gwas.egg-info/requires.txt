@@ -1,0 +1,6 @@
+google-cloud-storage
+gnomad
+hail
+numpy
+pandas
+tqdm
