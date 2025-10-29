@@ -2,9 +2,7 @@
 Code for the All-x-All AoU project.
 
 
-<div style="background-color: #ffebeb; border: 1px solid #ff0000; padding: 10px; border-radius: 5px;">
-  <p style="color: #ff0000; margin: 0;">Note: The scripts in this GitHub repository are not compatible with the All of Us Researcher Workbench. We are in the process of adapting the code and developing a public workspace to enable users to reproduce the analyses within the Workbench environment. Updates will be provided once the workspace becomes available.!</p>
-</div>
+<code style="color : red">Note: The scripts in this GitHub repository are not compatible with the All of Us Researcher Workbench. We are in the process of adapting the code and developing a public workspace to enable users to reproduce the analyses within the Workbench environment. Updates will be provided once the workspace becomes available.</code>
 
 ## Project Overview
 ### Description
