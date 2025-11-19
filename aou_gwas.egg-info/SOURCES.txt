@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+setup.py
+aou_gwas/__init__.py
+aou_gwas.egg-info/PKG-INFO
+aou_gwas.egg-info/SOURCES.txt
+aou_gwas.egg-info/dependency_links.txt
+aou_gwas.egg-info/requires.txt
+aou_gwas.egg-info/top_level.txt

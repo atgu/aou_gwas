@@ -4,14 +4,10 @@ __author__ = "wlu"
 
 import argparse
 
-# from aou_gwas import *  # for dataproc
-from gnomad.utils.vep import *
-from gnomad.utils.filtering import *
-from datetime import date
-from utils.utils import *  # for QoB
-from utils.annotations import * # for QoB
-from utils.resources import *  # for QoB
-from utils.resources import annotate_adj  # for QoB
+from aou_gwas.utils.utils import *  # for QoB
+from aou_gwas.utils.annotations import * # for QoB
+from aou_gwas.utils.resources import *  # for QoB
+from aou_gwas.utils.resources import annotate_adj  # for QoB
 import hail as hl
 import hailtop.fs as hfs
 

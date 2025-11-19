@@ -102,7 +102,7 @@ def create_raw_gene_map(pop: str, overwrite: bool = False, batch_mode=False):
         overwrite: Whether to overwrite existing files
         batch_mode: Whether the function is being run in a batch job
     """
-    from annotations import create_gene_map_ht
+    from aou_gwas.utils.annotations import create_gene_map_ht
 
     if batch_mode:
         initialize_hail(batch_mode=batch_mode, log_file=f"/create_raw_gene_map_{pop}.log")
@@ -172,7 +172,7 @@ def process_gene_map(pop: str, overwrite: bool = False, batch_mode=False):
         overwrite: Whether to overwrite existing files
         batch_mode: Whether the function is being run in a batch job
     """
-    from annotations import post_process_gene_map_ht
+    from aou_gwas.utils.annotations import post_process_gene_map_ht
 
     if batch_mode:
         initialize_hail(batch_mode=batch_mode, log_file=f"/process_gene_map_{pop}.log")

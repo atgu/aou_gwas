@@ -17,9 +17,7 @@ from tqdm import tqdm
 import uuid
 
 from aou_gwas import *  # for dataproc
-# from utils.utils import *  # for QoB
-# from utils.resources import *  # for QoB
-# from utils.results_loading import * # for QoB
+
 
 def get_files_in_parent_directory(parent_dir, fname: str = 'variant_results.ht'):
     all_outputs = []
