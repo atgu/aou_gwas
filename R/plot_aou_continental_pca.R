@@ -1,7 +1,7 @@
 source('~/CHARR/R/constants.R')
 library(tidyverse)
 library(RColorBrewer)
-# install.packages('~/Downloads/maptools_1.1-8.tar.gz', repos=NULL, type='source')
+install.packages('~/Downloads/maptools_1.1-8.tar.gz', repos=NULL, type='source')
 # .tar.gz file downloaded from https://cran.r-project.org/src/contrib/Archive/maptools/
 library(maptools)
 library(cowplot)
@@ -216,9 +216,11 @@ save_filt_plots <- function(pop_name, pop_dist, cutpoint0, cutpoint1) {
 afr_cut <- save_filt_plots('afr', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'AFR')), 3), 100, 8)
 amr_cut <- save_filt_plots('amr', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'AMR')), 3), 100, 8)
 eas_cut <- save_filt_plots('eas', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'EAS')), 3), 100, 6.5)
-eur_cut <- save_filt_plots('eur', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'EUR')), 5), 100, 10)
+eur_cut <- save_filt_plots('eur', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'EUR')), 5), 100, 10) 
 mid_cut <- save_filt_plots('mid', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'MID')), 5), 100, 5)
 sas_cut <- save_filt_plots('sas', pop_ellipse(as.data.frame(aou_pc_full %>% filter(pop == 'SAS')), 3), 100, 5)
+
+write.table(eur_cut %>% select(s), '~/Downloads/aou_eur_centroid_pruned_2.5.tsv', row.names=F, sep='\t', quote=F)
 
 pop_cuts <- sas_cut %>%
   # bind_rows(eas_cut, mid_cut) %>%
