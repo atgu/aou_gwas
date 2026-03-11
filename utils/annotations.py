@@ -70,6 +70,8 @@ def create_gene_map_ht(snpindel_ht, check_gene_contigs=False, freq_field=None):
         if freq_field is not None:
             ht = ht.annotate(_af=ht[freq_field])
             fields.append('_af')
+        ht = ht.annotate(vep=ht.vep.annotate(transcript_consequences=ht.vep.transcript_consequences.filter(lambda x: x.gene_id.startswith('ENSG'))))    
+        print('...Filtered to ENSG...')
         ht = process_consequences(ht)
         ht = ht.explode(ht.vep.worst_csq_by_gene_canonical)
         ht = ht.filter(ht.vep.worst_csq_by_gene_canonical.gene_id.startswith('ENSG'))
