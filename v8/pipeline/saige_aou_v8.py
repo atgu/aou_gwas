@@ -858,70 +858,386 @@ def export_bgen_from_mt(
     print(hl.utils.range_table(10)._force_count())
 
 
-def export_gene_group_file(interval, ancestry, output_dir, weight_saige_gene = None):
-    gene_ht_path = f'{DATA_PATH}/utils/gene_map/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
+CUBIC_ROOT_TRANSITIONS: List[float] = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+BETA_B_SCORE:           List[float] = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0]
+BETA_B_MAF:             List[float] = [2.0, 5.0]
+MAC_THRESHOLDS:         List[int]   = [1, 3, 5, 10, 25, 50, 100, 200, 500]
+
+SCORE_WEIGHT_KEYS: List[str] = (
+    ["unweighted", "lof_only"]
+    + [f"cubic_root_t{t}" for t in CUBIC_ROOT_TRANSITIONS]
+    + [f"beta_b{b}"        for b in BETA_B_SCORE]
+)
+
+MAF_WEIGHT_KEYS: List[str] = (
+    ["maf_unweighted"]
+    + [f"maf_beta_b{b}" for b in BETA_B_MAF]
+    + [f"maf_mac{mac}"  for mac in MAC_THRESHOLDS]
+)
+
+COMBINED_WEIGHT_KEYS: List[str] = [
+    f"{sk}__{mk}" for sk in SCORE_WEIGHT_KEYS for mk in MAF_WEIGHT_KEYS
+]
+N_WEIGHTS = len(COMBINED_WEIGHT_KEYS)
+
+
+def _hl_cubic_root_weight(
+    s: hl.expr.Float64Expression,
+    t: float,
+) -> hl.expr.Float64Expression:
+    t_cbrt  = t ** (1.0 / 3.0)
+    denom   = abs(1.0 - t) ** (1.0 / 3.0) + t_cbrt
+    diff    = s - t
+    numer   = hl.sign(diff) * hl.abs(diff) ** (1.0 / 3.0) + t_cbrt
+    return numer / denom
+
+
+def _hl_beta_score_weight(
+    s: hl.expr.Float64Expression,
+    b: float,
+) -> hl.expr.Float64Expression:
+    return hl.abs(s) ** (b - 1.0)
+
+
+def _hl_maf_beta_weight(
+    maf: hl.expr.Float64Expression,
+    b: float,
+    maf_scale: float = 0.001,
+) -> hl.expr.Float64Expression:
+    return _hl_beta_score_weight(maf / maf_scale, b)
+
+
+def _hl_maf_threshold_weight(
+    maf: hl.expr.Float64Expression,
+    mac: int,
+    n_samples: int,
+) -> hl.expr.Float64Expression:
+    threshold = mac / (2.0 * n_samples)
+    return hl.if_else(maf <= threshold, hl.float64(1.0), hl.float64(0.0))
+
+
+def combined_weight_array_expr(
+    s_expr:      hl.expr.Float64Expression,
+    is_lof_expr: hl.expr.BooleanExpression,
+    maf_expr:    hl.expr.Float64Expression,
+    n_samples:   int,
+) -> hl.expr.ArrayExpression:
+    score_w: List[hl.expr.Float64Expression] = [
+        hl.float64(1.0),
+        hl.if_else(is_lof_expr, hl.float64(1.0), hl.float64(0.0)),
+        *[_hl_cubic_root_weight(s_expr, t) for t in CUBIC_ROOT_TRANSITIONS],
+        *[_hl_beta_score_weight(s_expr, b)  for b in BETA_B_SCORE],
+    ]
+
+    maf_w: List[hl.expr.Float64Expression] = [
+        hl.float64(1.0),
+        *[_hl_maf_beta_weight(maf_expr, b)               for b in BETA_B_MAF],
+        *[_hl_maf_threshold_weight(maf_expr, mac, n_samples) for mac in MAC_THRESHOLDS],
+    ]
+
+    return hl.array([sw * mw for sw in score_w for mw in maf_w])
+
+
+def annotate_flexrv_weights(
+    ht:                 hl.Table,
+    score_field:        str,
+    maf_field:          str,
+    n_samples:          int,
+    is_lof_field:       Optional[str]  = None,
+    is_lof_const:       Optional[bool] = None,
+    fill_missing_score: float          = 0.0,
+) -> hl.Table:
+    if (is_lof_field is None) == (is_lof_const is None):
+        raise ValueError(
+            "Provide exactly one of `is_lof_field` or `is_lof_const`."
+        )
+
+    score_arr = ht[score_field]
+    maf_arr   = ht[maf_field]
+
+    if is_lof_field is not None:
+        is_lof_arr: Optional[hl.expr.ArrayExpression] = ht[is_lof_field]
+    else:
+        is_lof_arr = None
+
+    def weight_vec_for_index(
+        i: hl.expr.Int32Expression,
+    ) -> hl.expr.ArrayExpression:
+        s_i   = hl.or_else(hl.float64(score_arr[i]), hl.float64(fill_missing_score))
+        maf_i = hl.or_else(hl.float64(maf_arr[i]),   hl.float64(0.0))
+
+        if is_lof_arr is not None:
+            is_lof_i: hl.expr.BooleanExpression = hl.bool(is_lof_arr[i])
+        else:
+            is_lof_i = hl.bool(is_lof_const)
+
+        return combined_weight_array_expr(
+            s_expr      = s_i,
+            is_lof_expr = is_lof_i,
+            maf_expr    = maf_i,
+            n_samples   = n_samples,
+        )
+
+    weight_matrix_expr = (
+        hl.range(hl.len(score_arr))
+        .map(weight_vec_for_index)
+    )
+
+    return ht.annotate(
+        weight_matrix  = weight_matrix_expr,
+        n_variants     = hl.len(score_arr),
+    )
+
+
+def export_gene_group_file(interval, ancestry, mode, target_col, output_dir):
+
+    def gene_label(ht):
+        return (
+            hl.if_else(hl.is_missing(ht.gene_id), '_', ht.gene_id)
+            + '_'
+            + hl.if_else(hl.is_missing(ht.gene_symbol), '_', ht.gene_symbol)
+        )
+
+    def repeat_annotation(ht):
+        return ht.annotate(annotation=(ht.annotation + ' ') * hl.len(ht.variants))
+
+    def finalize_and_export(var_ht, anno_ht, output_path, weight_ht=None):
+        group_ht = var_ht.union(anno_ht) if weight_ht is None else var_ht.union(anno_ht, weight_ht)
+        group_ht = group_ht.group_by('gene', 'tag').aggregate(
+            info=hl.agg.collect(group_ht.info)
+        )
+        group_ht = group_ht.annotate(info=hl.str(' ').join(group_ht.info))
+
+        tag_order = hl.dict({'var': 0, 'anno': 1, 'weight': 2})
+        group_ht = group_ht.annotate(tag_rank=tag_order[group_ht.tag])
+        group_ht = group_ht.order_by(group_ht.gene, group_ht.tag_rank)
+        group_ht = group_ht.drop('tag_rank')
+        group_ht.export(output_path, header=False, delimiter=' ')
+
+    def group_by_gene(ht, extra_aggs=None):
+        aggs = dict(
+            variants=hl.flatten(hl.agg.collect(ht.variants)),
+            annotation=hl.agg.take(ht.annotation, 1)[0],
+        )
+        if extra_aggs:
+            aggs.update(extra_aggs)
+        return ht.group_by(gene=gene_label(ht)).aggregate(**aggs)
+
+    gene_ht_path = f'{ANALYSIS_BUCKET}/brava_annot/data/utils/gene_map/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
     gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
-    
-    if weight_saige_gene is None:
-        processed_gene_ht = gene_ht        
-        var_ht = processed_gene_ht.select(
-            gene=hl.if_else(hl.is_missing(processed_gene_ht.gene_id), '_', processed_gene_ht.gene_id) + '_' + 
-                 hl.if_else(hl.is_missing(processed_gene_ht.gene_symbol), '_', processed_gene_ht.gene_symbol),
-            tag='var',
-            info=hl.delimit(processed_gene_ht.variants, " ")
-        ).annotate(idx=1).key_by().drop("start")
-        anno_ht = processed_gene_ht.select(
-            gene=hl.if_else(hl.is_missing(processed_gene_ht.gene_id), '_', processed_gene_ht.gene_id) + '_' + 
-                 hl.if_else(hl.is_missing(processed_gene_ht.gene_symbol), '_', processed_gene_ht.gene_symbol),
-            tag='anno',
-            info=processed_gene_ht.annotation
-        ).annotate(idx=2).key_by().drop("start")
 
-        group_ht = var_ht.union(anno_ht)
-        
-    else:
-        null_weight_mask = gene_ht.weights.map(lambda w: hl.is_missing(w[weight_saige_gene]) | hl.is_nan(w[weight_saige_gene]))
-        filtered_gene_ht = gene_ht.annotate(
-            variants_filtered = hl.zip(gene_ht.variants, null_weight_mask).filter(lambda x: ~x[1]).map(lambda x: x[0]),
-            annotation_filtered = hl.delimit(
-                hl.zip(gene_ht.annotation.split(' '), null_weight_mask)
-                .filter(lambda x: ~x[1])
-                .map(lambda x: x[0]), 
-                ' '
-            ),
-            weights_filtered = hl.zip(gene_ht.weights, null_weight_mask).filter(lambda x: ~x[1]).map(lambda x: x[0])
+    if mode == 'unguided':
+        gene_ht = repeat_annotation(gene_ht)
+        var_ht = (gene_ht
+                  .select(gene=gene_label(gene_ht),tag='var',info=hl.delimit(gene_ht.variants, ' '))
+                  .add_index().key_by().drop('start'))
+        anno_ht = (gene_ht
+                   .select(gene=gene_label(gene_ht),tag='anno',info=gene_ht.annotation[:-1])
+                   .add_index().key_by().drop('start'))
+
+        finalize_and_export(var_ht, anno_ht, output_dir)
+
+    elif mode == 'agg':
+        if target_col is None:
+            raise ValueError("target_col must be specified for agg mode")
+
+        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
+        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
+
+        if target_col in scallion_fields:
+            weight_array_expr = lambda ht: ht.scallion_pred
+        elif target_col in vsms_fields:
+            weight_array_expr = lambda ht: ht.vsms
+        else:
+            raise ValueError(
+                f"target_col '{target_col}' not found in either 'scallion_pred' "
+                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
+                f"(fields: {sorted(vsms_fields)})."
+            )
+
+        plof_grouped = group_by_gene(gene_ht.filter(gene_ht.annotation == 'pLoF'))
+
+        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
+        missense_ht = missense_ht.annotate(
+            variants=hl.zip(missense_ht.variants, weight_array_expr(missense_ht))
+                .filter(lambda pair: pair[1][target_col] == 1)
+                .map(lambda pair: pair[0])
         )
-        
-        var_ht = filtered_gene_ht.select(
-            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
-                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
-            tag='var',
-            info=hl.delimit(filtered_gene_ht.variants_filtered, " ")
-        ).annotate(idx=1).key_by().drop("start")
+        missense_grouped = group_by_gene(missense_ht)
 
-        anno_ht = filtered_gene_ht.select(
-            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
-                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
-            tag='anno',
-            info=filtered_gene_ht.annotation_filtered
-        ).annotate(idx=2).key_by().drop("start")
-        
-        weight_ht = filtered_gene_ht.select(
-            gene=hl.if_else(hl.is_missing(filtered_gene_ht.gene_id), '_', filtered_gene_ht.gene_id) + '_' + 
-                 hl.if_else(hl.is_missing(filtered_gene_ht.gene_symbol), '_', filtered_gene_ht.gene_symbol),
-            tag='weight',
-            info=hl.delimit(filtered_gene_ht.weights_filtered.map(lambda w: hl.str(w[weight_saige_gene])), " ")
-        ).annotate(idx=3).key_by().drop("start")
+        plof_grouped = repeat_annotation(plof_grouped)
+        missense_grouped = repeat_annotation(missense_grouped)
 
-        group_ht = var_ht.union(anno_ht).union(weight_ht)
-    
-    group_ht = group_ht.group_by('gene', 'tag', 'idx').aggregate(info = hl.agg.collect(group_ht.info))
-    group_ht = group_ht.annotate(info = hl.str(' ').join(group_ht.info))
-    group_ht = group_ht.order_by(group_ht.gene, group_ht.idx).drop('idx')
-    group_ht.show()
-    group_ht.export(output_dir, header=False, delimiter=' ')
-    print("DATA EXPORTED")
+        combined = plof_grouped.annotate(
+            variants=plof_grouped.variants.extend(
+                hl.or_else(missense_grouped[plof_grouped.gene].variants, hl.empty_array(hl.tstr))
+            ),
+            annotation=(
+                plof_grouped.annotation
+                + hl.or_else(missense_grouped[plof_grouped.gene].annotation, '')
+            )
+        )
+        combined = combined.filter(hl.len(combined.variants) > 0)
+
+        var_ht = (combined
+                .select(tag='var', info=hl.delimit(combined.variants, ' '))
+                .add_index().key_by())
+        anno_ht = (combined
+                .select(tag='anno', info=combined.annotation[:-1])
+                .add_index().key_by())
+
+        finalize_and_export(var_ht, anno_ht, output_dir)
+
+    elif mode == 'weighted':
+        if target_col is None:
+            raise ValueError("target_col must be specified for miss_weight mode")
+
+        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
+        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
+
+        if target_col in scallion_fields:
+            weight_array_expr = lambda ht: ht.scallion_pred
+        elif target_col in vsms_fields:
+            weight_array_expr = lambda ht: ht.vsms
+        else:
+            raise ValueError(
+                f"target_col '{target_col}' not found in either 'scallion_pred' "
+                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
+                f"(fields: {sorted(vsms_fields)})."
+            )
+
+        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
+        missense_ht = missense_ht.annotate(
+            weights=weight_array_expr(missense_ht).map(
+                lambda w: hl.str(hl.or_else(hl.float64(w[target_col]), hl.float64(0)))
+            )
+        )
+
+        missense_grouped = group_by_gene(
+            missense_ht,
+            extra_aggs={'weights': hl.flatten(hl.agg.collect(missense_ht.weights))}
+        )
+        missense_grouped = repeat_annotation(missense_grouped)
+        missense_grouped = missense_grouped.filter(hl.len(missense_grouped.variants) > 0)
+
+        var_ht    = (missense_grouped
+                     .select(tag='var',    info=hl.delimit(missense_grouped.variants,  ' '))
+                     .add_index().key_by())
+        anno_ht   = (missense_grouped
+                     .select(tag='anno',   info=missense_grouped.annotation[:-1])
+                     .add_index().key_by())
+        weight_ht = (missense_grouped
+                     .select(tag='weight', info=hl.delimit(missense_grouped.weights, ' '))
+                     .add_index().key_by())
+
+        finalize_and_export(var_ht, anno_ht, output_dir, weight_ht)
+
+    elif mode == 'flexRV':
+        if target_col is None:
+            raise ValueError("target_col must be specified for flexRV mode")
+
+        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
+        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
+
+        if target_col in scallion_fields:
+            weight_array_expr = lambda ht: ht.scallion_pred
+        elif target_col in vsms_fields:
+            weight_array_expr = lambda ht: ht.vsms
+        else:
+            raise ValueError(
+                f"target_col '{target_col}' not found in either 'scallion_pred' "
+                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
+                f"(fields: {sorted(vsms_fields)})."
+            )
+
+        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
+        missense_ht = missense_ht.annotate(
+            weights=weight_array_expr(missense_ht).map(
+                lambda w: hl.str(hl.or_else(hl.float64(w[target_col]), hl.float64(0)))
+            )
+        )
+        missense_grouped = group_by_gene(
+            missense_ht,
+            extra_aggs={
+                'weights': hl.flatten(hl.agg.collect(missense_ht.weights)),
+                'af':      hl.flatten(hl.agg.collect(missense_ht.AF)),
+            }
+        )
+        missense_grouped = repeat_annotation(missense_grouped)
+        missense_ht = annotate_flexrv_weights(
+            ht           = missense_grouped,
+            score_field  = 'weights',
+            maf_field    = 'af',
+            n_samples    = 100000,
+            is_lof_const = False,
+        ).drop('weights')
+
+        plof_ht = gene_ht.filter(gene_ht.annotation == 'pLoF')
+        plof_grouped = group_by_gene(
+            plof_ht,
+            extra_aggs={
+                'weights': hl.flatten(hl.agg.collect(hl.map(lambda _: hl.float64(1.0), plof_ht.AF))),
+                'af':      hl.flatten(hl.agg.collect(plof_ht.AF))
+            }
+        )
+        plof_grouped = repeat_annotation(plof_grouped)
+
+        plof_ht = annotate_flexrv_weights(
+            ht           = plof_grouped,
+            score_field  = 'weights',
+            maf_field    = 'af',
+            n_samples    = 100000,
+            is_lof_const = True,
+        ).drop('weights')
+
+        plof_renamed = plof_ht.rename({
+            'variants':     'plof_variants',
+            'annotation':   'plof_annotation',
+            'weight_matrix':'plof_weight_matrix',
+            'n_variants':   'plof_n_variants',
+            'af':           'plof_af',
+        })
+
+        combined_ht = missense_ht.join(plof_renamed, how='outer')
+        combined_ht = combined_ht.annotate(
+            variants=hl.or_else(combined_ht.variants,      hl.empty_array(hl.tstr))
+                      .extend(hl.or_else(combined_ht.plof_variants, hl.empty_array(hl.tstr))),
+            annotation=(
+                hl.or_else(combined_ht.annotation,     '')
+                + hl.or_else(combined_ht.plof_annotation, '')
+            ),
+            weight_matrix=hl.or_else(combined_ht.weight_matrix,      hl.empty_array(hl.tarray(hl.tfloat64)))
+                           .extend(hl.or_else(combined_ht.plof_weight_matrix, hl.empty_array(hl.tarray(hl.tfloat64)))),
+        )
+        combined_ht = combined_ht.drop(
+            'plof_variants', 'plof_annotation', 'plof_weight_matrix',
+            'plof_n_variants', 'plof_af', 'n_variants', 'af',
+        )
+        combined_ht = combined_ht.filter(hl.len(combined_ht.variants) > 0)
+
+        var_ht = (combined_ht
+                  .select(tag='var', info=hl.delimit(combined_ht.variants, ' '))
+                  .add_index().key_by())
+        anno_ht = (combined_ht
+                   .select(tag='anno', info=combined_ht.annotation[:-1])
+                   .add_index().key_by())
+
+        for k in range(N_WEIGHTS):
+            weight_ht = (combined_ht
+                         .select(
+                             tag='weight',
+                             info=hl.delimit(
+                                 combined_ht.weight_matrix.map(lambda wv: hl.str(wv[k])),
+                                 ' ',
+                             ),
+                         )
+                         .add_index().key_by())
+
+            finalize_and_export(var_ht, anno_ht, output_dir.replace(".txt", f"_w{k}.txt"), weight_ht)
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Expected 'unguided', 'agg', 'weighted', or 'flexRV'.")
+
 
 
 def index_bgen(b: hb.batch.Batch, ancestry:str, analysis_type:str, bgen: str, depend_job=None):
