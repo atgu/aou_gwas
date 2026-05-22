@@ -1,0 +1,10 @@
+# Python dependencies for the aou_gwas pipelines.
+# Versions match what the production Docker images were tested against.
+
+hail==0.2.135
+gnomad==0.8.2
+numpy
+scipy
+pandas
+google-cloud-storage
+pysnptools
