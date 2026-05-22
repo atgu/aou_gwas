@@ -2,18 +2,16 @@
 Code for the *All-by-All AoU* project: GWAS and rare-variant association
 (RVAS) analyses on the All of Us Research Program data.
 
-<code style="color : red">Note: The scripts in this GitHub repository are not directly executable on
-the All of Us Researcher Workbench. We are in the process of adapting the
-code and developing a public workspace to enable users to reproduce the
-analyses within the Workbench environment. Updates will be posted here once
-the workspace becomes available.</code>
+> [!CAUTION]
+> The scripts in this GitHub repository are **NOT** directly executable on the
+> All of Us Researcher Workbench. We are in the process of adapting the code
+> and developing a public workspace to enable users to reproduce the
+> analyses within the Workbench environment. Updates will be posted here
+> once the workspace becomes available.
 
 ## Project Overview
 GWAS and RVAS on the AoU data, with companion meta-analyses against UKB and
 FinnGen.
-
-### Contributors
-- Wenhan Lu ([@wlu04](https://github.com/wlu04))
 
 ## Repository layout
 - [R/](R/) — R utilities for plotting and downstream analysis (QQ / Manhattan,
