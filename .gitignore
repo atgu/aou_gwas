@@ -1,0 +1,14 @@
+# Python build artifacts
+build/
+dist/
+*.egg-info
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Hail driver logs
+hail-*.log
+
+# macOS
+.DS_Store
