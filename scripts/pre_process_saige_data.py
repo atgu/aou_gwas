@@ -141,7 +141,9 @@ def main(args):
                 ht = ht.annotate(
                     variant_id=ht.locus.contig + ':' + hl.str(ht.locus.position) + ':' + ht.alleles[0] + ':' +
                                ht.alleles[1],
-                    annotation=annotation_case_builder(ht.vep.worst_csq_by_gene_canonical))
+                    annotation=annotation_case_builder(
+                        hl.struct(worst_csq_by_gene_canonical=ht.vep.worst_csq_by_gene_canonical),
+                        annot_type='snp_indel'))
                 ht = ht.select(
                     annotation = ht.annotation,
                     variant_id = ht.variant_id,

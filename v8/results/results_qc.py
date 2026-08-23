@@ -144,9 +144,11 @@ def main(args):
         ht = process_consequences(ht)
         ht = ht.explode(ht.vep.worst_csq_by_gene_canonical)
         ht = ht.filter(ht.vep.worst_csq_by_gene_canonical.gene_id.startswith('ENSG'))
-        ht = ht.annotate(annotation=annotation_case_builder(ht.vep.worst_csq_by_gene_canonical),
+        ht = ht.annotate(annotation=annotation_case_builder(
+                             hl.struct(worst_csq_by_gene_canonical=ht.vep.worst_csq_by_gene_canonical),
+                             annot_type='snp_indel'),
                          gene_id=ht.vep.worst_csq_by_gene_canonical.gene_id,
-                         gene_symbol=ht.vep.worst_csq_by_gene_canonical.gene_symbol) 
+                         gene_symbol=ht.vep.worst_csq_by_gene_canonical.gene_symbol)
         ht = ht.annotate(annotation = hl.if_else(hl.literal({'missense', 'LC'}).contains(ht.annotation), 'missenseLC', ht.annotation))
         ht = ht.checkpoint(f'{DATA_PATH}/qc/aou_exome_variant_qc_annotated.ht', _read_if_exists=not args.overwrite, overwrite=args.overwrite)
         combined_ht = ht.filter(hl.literal(['missenseLC', 'pLoF']).contains(ht.annotation))

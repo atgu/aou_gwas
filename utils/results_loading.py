@@ -27,10 +27,15 @@ def get_vep_formatted_data(vep_path: str, legacy_annotations: bool = False):
     ht = hl.read_table(vep_path)
     ht = process_consequences(ht)
     ht = ht.explode(ht.vep.worst_csq_by_gene_canonical)
-    annotation_func = annotation_case_builder_ukb_legacy if legacy_annotations else annotation_case_builder
+    if legacy_annotations:
+        annotation_expr = annotation_case_builder_ukb_legacy(ht.vep.worst_csq_by_gene_canonical)
+    else:
+        annotation_expr = annotation_case_builder(
+            hl.struct(worst_csq_by_gene_canonical=ht.vep.worst_csq_by_gene_canonical),
+            annot_type='snp_indel')
     return ht.select(
         gene=ht.vep.worst_csq_by_gene_canonical.gene_symbol,
-        annotation=annotation_func(ht.vep.worst_csq_by_gene_canonical))
+        annotation=annotation_expr)
 
 
 
