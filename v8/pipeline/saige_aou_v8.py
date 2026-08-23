@@ -2,24 +2,29 @@
 
 __author__ = "wlu"
 
-import hail as hl
 import copy
+import math
+import sys
 from collections import Counter
 import pandas as pd
 import pickle
 import argparse
 import logging
-import hailtop.batch as hb
-import hailtop.fs as hfs
-from hailtop.batch.resource import Resource, ResourceGroup
-from hailtop.batch.job import Job
-from hailtop.batch.batch import Batch
 from collections import Counter
 from shlex import quote as shq
 import time
 from typing import *
 from tqdm import tqdm
 import warnings
+from typing import Union
+
+import hail as hl
+import hailtop.batch as hb
+import hailtop.fs as hfs
+from hailtop.batch.resource import Resource, ResourceGroup
+from hailtop.batch.job import Job
+from hailtop.batch.batch import Batch
+
 
 def range_table(log_file):
     import hail as hl
@@ -27,15 +32,80 @@ def range_table(log_file):
     print(hl.utils.range_table(10)._force_count())
 
 
-TRANCHE = "v8"
-MY_BUCKET = 'gs://aou_wlu'
-ANALYSIS_BUCKET = "gs://aou_analysis/v8"
-DATA_PATH = f'{ANALYSIS_BUCKET}/data'
+ACAF_MT_PATH = 'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt'
+EXOME_MT_PATH = 'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/exome/splitMT/hail.mt'
+
+## PATHS
 TMP_BUCKET = 'gs://aou_tmp/v8'
+MY_BUCKET = 'gs://aou_amc'
+ANALYSIS_BUCKET = "gs://aou_amc_analyses"
+RESULTS_PATH = f'{ANALYSIS_BUCKET}/results'
+DATA_PATH = f'{ANALYSIS_BUCKET}/data'
+TRANCHE = 'v8'
+
+EXTERNAL_DATA_PATH = 'gs://aou_analysis/v8/data'
+EXTERNAL_ANALYSIS_BUCKET = "gs://aou_analysis/v8"
+
+ACAF_MT_PATH = ''
+EXOME_MT_PATH = ''
+
+
+SAIGE_DOCKER_IMAGE = "us-central1-docker.pkg.dev/aou-neale-gwas/saige/saige.multiweights:SKATO"
+LEGACY_SAIGE_MODE = "legacy_saige_no_weights"
+SAIGE_DOCKER_IMAGE_BY_MODE = {
+    LEGACY_SAIGE_MODE: "wzhou88/saige:1.5.1"
+}
+
+GROUP_FILE_MODE_ALIASES = {LEGACY_SAIGE_MODE: "unguided"}
+
+GENE_MAP_SOURCES = {'brava', 'gnomad_context'}
+
+
+def resolve_saige_docker_image(mode: str) -> str:
+    """SAIGE image for a --saige-gene-mode, defaulting to the multiweight build."""
+    return SAIGE_DOCKER_IMAGE_BY_MODE.get(mode, SAIGE_DOCKER_IMAGE)
+
+
+def resolve_group_file_mode(mode: str) -> str:
+    """Mode whose directory holds the group files this mode should read."""
+    return GROUP_FILE_MODE_ALIASES.get(mode, mode)
+
+
+HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.133-py3.11"
+QQ_DOCKER_IMAGE = "konradjk/saige_qq:0.2"
+
+logging.basicConfig(
+    format="%(levelname)s (%(name)s %(lineno)s): %(message)s",
+    level="INFO",
+    filename="saige_pipeline.log",
+)
+logger = logging.getLogger("ALL_x_AoU_SAIGE")
+logger.setLevel(logging.INFO)
+
+
+
+## CONSTANTS
+CHUNK_SIZE = {'all': int(1.25e6),'eur': int(6.25e6), "afr": int(1.25e7), "amr": int(1.25e7), "eas": int(1.25e7), "mid": int(1.25e7), "sas": int(1.25e7)}
+
+PILOT_PHENOTYPES = ["height", "heart-rate-mean", "A10BJ", "A10BJ06", "random_0.5_continuous_1", "random_0.5_0.01_1", "random_0.5_0.5_1", "random_0.5_0.2_1", 
+                    "random_0.5_0.1_1", "random_0.5_0.001_1"]
+PILOT_PHENOTYPES = PILOT_PHENOTYPES + [f'{pheno}_male' for pheno in PILOT_PHENOTYPES] + [f'{pheno}_female' for pheno in PILOT_PHENOTYPES] + \
+                    ["Birth_to_PULMHEART_amr_ALL", "Birth_to_CAD_eas_ALL", "Birth_to_CAD_sas_ALL", "Birth_to_MI_eur_ALL", "Birth_to_DEMENTIA_eur_ALL",
+                    "Birth_to_ATHSCLE_eur_ALL", "HYPTENSESS_to_MI_eur_ALL", "PARKINSON_to_DEMENTIA_eur_ALL", "T2D_to_ATHSCLE_eur_ALL", 'Birth_to_LUNGCA_afr_ALL']
+PHENO_CATEGORIES = ['physical_measurement', 'r_drug', 'pfhh_survey', 'random_pheno', 'lab_measurement', 'mcc2_phecode', 'mcc2_phecodex', 'onset', 'progression']
+QUANTITATIVE_CATEGORIES = ['physical_measurement', 'lab_measurement']
+GATE_CATEGORIES = ['onset', 'progression']
+BINARY_CATEGORIES = ['r_drug', 'pfhh_survey', 'mcc2_phecode', 'mcc2_phecodex']
+
+N_SAMPLES_PRUNED = {'afr': 77444, 'amr': 71540, 'eas': 9488, 'eur': 227273, 'mid': 1153, 'sas': 5132, 'all': 0}
+
+
+
+
+
 
 N_GENE_PER_GROUP = 100
-CHUNK_SIZE = {'all': int(1.25e6),'eur': int(6.25e6), "afr": int(1.25e7), "amr": int(1.25e7), "eas": int(1.25e7), "mid": int(1.25e7), "sas": int(1.25e7)}
-# old_CHUNK_SIZE = {'all': int(1.25e6),'eur': int(1.25e7), "afr": int(2.5e7), "amr": int(2.5e7), "eas": int(2.5e7), "mid": int(2.5e7), "sas": int(2.5e7)}
+CHUNK_SIZE = {'all': int(1.6e6),'eur': int(3.125e6), "afr": int(1.25e7), "amr": int(1.25e7), "eas": int(2.5e7), "mid": int(2.5e7), "sas": int(2.5e7)} # new for smaller EUR and ALL bigger others 
 REFERENCE = "GRCh38"
 CHROMOSOMES = list(map(str, range(1, 23))) + ["X", "Y"]
 
@@ -181,17 +251,7 @@ def get_filtered_mt(mt_type: hl.tstr,
 
 ################################################ Remove after docker image is built ################################################
 
-logging.basicConfig(
-    format="%(levelname)s (%(name)s %(lineno)s): %(message)s",
-    level="INFO",
-    filename="saige_pipeline.log",
-)
-logger = logging.getLogger("ALL_x_AoU_SAIGE")
-logger.setLevel(logging.INFO)
 
-HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.133-py3.11"
-SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.4.4"  # latest
-QQ_DOCKER_IMAGE = "konradjk/saige_qq:0.2"
 
 def annotate_expected_pvalue(ht: hl.Table, method:str, p_field: str='Pvalue', k:int = 5000):
     n = ht.count()
@@ -261,7 +321,6 @@ def annotate_expected_pvalue(ht: hl.Table, method:str, p_field: str='Pvalue', k:
     ht = ht.annotate(**{f'{p_field}_expected_log10': -hl.log10(ht[f'{p_field}_expected'])},)
 
     return ht
-
 
 def load_gene_data(directory: str,
                    output_ht_directory: str,
@@ -792,7 +851,6 @@ def gt_to_gp(mt, location: str = "GP"):
         }
     )
 
-
 def impute_missing_gp(mt, location: str = "GP", mean_impute: bool = True):
     mt = mt.annotate_entries(_gp=mt[location])
     if mean_impute:
@@ -803,7 +861,6 @@ def impute_missing_gp(mt, location: str = "GP", mean_impute: bool = True):
     else:
         gp_expr = [1.0, 0.0, 0.0]
     return mt.annotate_entries(**{location: hl.or_else(mt._gp, gp_expr)}).drop("_gp")
-
 
 def export_bgen_from_mt(
     ancestry,
@@ -858,138 +915,25 @@ def export_bgen_from_mt(
     print(hl.utils.range_table(10)._force_count())
 
 
-CUBIC_ROOT_TRANSITIONS: List[float] = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-BETA_B_SCORE:           List[float] = [1.5, 2.0, 3.0, 5.0, 10.0, 20.0]
-BETA_B_MAF:             List[float] = [2.0, 5.0]
-MAC_THRESHOLDS:         List[int]   = [1, 3, 5, 10, 25, 50, 100, 200, 500]
-
-SCORE_WEIGHT_KEYS: List[str] = (
-    ["unweighted", "lof_only"]
-    + [f"cubic_root_t{t}" for t in CUBIC_ROOT_TRANSITIONS]
-    + [f"beta_b{b}"        for b in BETA_B_SCORE]
-)
-
-MAF_WEIGHT_KEYS: List[str] = (
-    ["maf_unweighted"]
-    + [f"maf_beta_b{b}" for b in BETA_B_MAF]
-    + [f"maf_mac{mac}"  for mac in MAC_THRESHOLDS]
-)
-
-COMBINED_WEIGHT_KEYS: List[str] = [
-    f"{sk}__{mk}" for sk in SCORE_WEIGHT_KEYS for mk in MAF_WEIGHT_KEYS
-]
-N_WEIGHTS = len(COMBINED_WEIGHT_KEYS)
 
 
-def _hl_cubic_root_weight(
-    s: hl.expr.Float64Expression,
-    t: float,
-) -> hl.expr.Float64Expression:
-    t_cbrt  = t ** (1.0 / 3.0)
-    denom   = abs(1.0 - t) ** (1.0 / 3.0) + t_cbrt
-    diff    = s - t
-    numer   = hl.sign(diff) * hl.abs(diff) ** (1.0 / 3.0) + t_cbrt
-    return numer / denom
+def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_dir):
+    MIN_VARIANTS = 2
+    MISSENSE_ANNOTATIONS = {'missenseother_missense', 'missenseLC'}
+    
 
+    if gene_map_source not in GENE_MAP_SOURCES:
+        raise ValueError(f"gene_map_source must be one of {sorted(GENE_MAP_SOURCES)}, got '{gene_map_source}'")
 
-def _hl_beta_score_weight(
-    s: hl.expr.Float64Expression,
-    b: float,
-) -> hl.expr.Float64Expression:
-    return hl.abs(s) ** (b - 1.0)
-
-
-def _hl_maf_beta_weight(
-    maf: hl.expr.Float64Expression,
-    b: float,
-    maf_scale: float = 0.001,
-) -> hl.expr.Float64Expression:
-    return _hl_beta_score_weight(maf / maf_scale, b)
-
-
-def _hl_maf_threshold_weight(
-    maf: hl.expr.Float64Expression,
-    mac: int,
-    n_samples: int,
-) -> hl.expr.Float64Expression:
-    threshold = mac / (2.0 * n_samples)
-    return hl.if_else(maf <= threshold, hl.float64(1.0), hl.float64(0.0))
-
-
-def combined_weight_array_expr(
-    s_expr:      hl.expr.Float64Expression,
-    is_lof_expr: hl.expr.BooleanExpression,
-    maf_expr:    hl.expr.Float64Expression,
-    n_samples:   int,
-) -> hl.expr.ArrayExpression:
-    score_w: List[hl.expr.Float64Expression] = [
-        hl.float64(1.0),
-        hl.if_else(is_lof_expr, hl.float64(1.0), hl.float64(0.0)),
-        *[_hl_cubic_root_weight(s_expr, t) for t in CUBIC_ROOT_TRANSITIONS],
-        *[_hl_beta_score_weight(s_expr, b)  for b in BETA_B_SCORE],
-    ]
-
-    maf_w: List[hl.expr.Float64Expression] = [
-        hl.float64(1.0),
-        *[_hl_maf_beta_weight(maf_expr, b)               for b in BETA_B_MAF],
-        *[_hl_maf_threshold_weight(maf_expr, mac, n_samples) for mac in MAC_THRESHOLDS],
-    ]
-
-    return hl.array([sw * mw for sw in score_w for mw in maf_w])
-
-
-def annotate_flexrv_weights(
-    ht:                 hl.Table,
-    score_field:        str,
-    maf_field:          str,
-    n_samples:          int,
-    is_lof_field:       Optional[str]  = None,
-    is_lof_const:       Optional[bool] = None,
-    fill_missing_score: float          = 0.0,
-) -> hl.Table:
-    if (is_lof_field is None) == (is_lof_const is None):
-        raise ValueError(
-            "Provide exactly one of `is_lof_field` or `is_lof_const`."
-        )
-
-    score_arr = ht[score_field]
-    maf_arr   = ht[maf_field]
-
-    if is_lof_field is not None:
-        is_lof_arr: Optional[hl.expr.ArrayExpression] = ht[is_lof_field]
-    else:
-        is_lof_arr = None
-
-    def weight_vec_for_index(
-        i: hl.expr.Int32Expression,
-    ) -> hl.expr.ArrayExpression:
-        s_i   = hl.or_else(hl.float64(score_arr[i]), hl.float64(fill_missing_score))
-        maf_i = hl.or_else(hl.float64(maf_arr[i]),   hl.float64(0.0))
-
-        if is_lof_arr is not None:
-            is_lof_i: hl.expr.BooleanExpression = hl.bool(is_lof_arr[i])
-        else:
-            is_lof_i = hl.bool(is_lof_const)
-
-        return combined_weight_array_expr(
-            s_expr      = s_i,
-            is_lof_expr = is_lof_i,
-            maf_expr    = maf_i,
-            n_samples   = n_samples,
-        )
-
-    weight_matrix_expr = (
-        hl.range(hl.len(score_arr))
-        .map(weight_vec_for_index)
+    hl.init(
+        master='local[*]',
+        tmp_dir=TMP_BUCKET,
+        default_reference="GRCh38",
+        spark_conf={
+            "spark.driver.memory":          "20g",
+            "spark.executor.memory":        "20g",
+        }
     )
-
-    return ht.annotate(
-        weight_matrix  = weight_matrix_expr,
-        n_variants     = hl.len(score_arr),
-    )
-
-
-def export_gene_group_file(interval, ancestry, mode, target_col, output_dir):
 
     def gene_label(ht):
         return (
@@ -1001,17 +945,37 @@ def export_gene_group_file(interval, ancestry, mode, target_col, output_dir):
     def repeat_annotation(ht):
         return ht.annotate(annotation=(ht.annotation + ' ') * hl.len(ht.variants))
 
-    def finalize_and_export(var_ht, anno_ht, output_path, weight_ht=None):
-        group_ht = var_ht.union(anno_ht) if weight_ht is None else var_ht.union(anno_ht, weight_ht)
+    def finalize_and_export(var_ht, anno_ht, weight_ht, output_path):
+        if weight_ht is None:
+            group_ht = var_ht.union(anno_ht)
+        else:
+            group_ht = var_ht.union(anno_ht).union(weight_ht)
+
         group_ht = group_ht.group_by('gene', 'tag').aggregate(
             info=hl.agg.collect(group_ht.info)
         )
         group_ht = group_ht.annotate(info=hl.str(' ').join(group_ht.info))
 
-        tag_order = hl.dict({'var': 0, 'anno': 1, 'weight': 2})
-        group_ht = group_ht.annotate(tag_rank=tag_order[group_ht.tag])
-        group_ht = group_ht.order_by(group_ht.gene, group_ht.tag_rank)
-        group_ht = group_ht.drop('tag_rank')
+        # Split on ',' instead of ':'
+        tag_base = hl.if_else(
+            group_ht.tag.contains(','),
+            group_ht.tag.split(',')[0],
+            group_ht.tag,
+        )
+        # Weight-scheme label after ',' (e.g. 'cubic_root_t0.2__maf_beta_b2.0' for flexRV)
+        tag_suffix_str = hl.if_else(
+            group_ht.tag.contains(','),
+            group_ht.tag.split(',')[1],
+            '',
+        )
+        base_order = hl.dict({'var': 0, 'anno': 1, 'weight': 2})
+        group_ht = group_ht.annotate(
+            tag_rank=base_order[tag_base],
+            tag_suffix=tag_suffix_str,
+        )
+        group_ht = group_ht.order_by(group_ht.gene, group_ht.tag_rank, group_ht.tag_suffix)
+        group_ht = group_ht.drop('tag_rank', 'tag_suffix')
+
         group_ht.export(output_path, header=False, delimiter=' ')
 
     def group_by_gene(ht, extra_aggs=None):
@@ -1023,220 +987,133 @@ def export_gene_group_file(interval, ancestry, mode, target_col, output_dir):
             aggs.update(extra_aggs)
         return ht.group_by(gene=gene_label(ht)).aggregate(**aggs)
 
-    gene_ht_path = f'{ANALYSIS_BUCKET}/brava_annot/data/utils/gene_map/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
+    def resolve_weight_array_expr(ht, target_col):
+        if target_col is None:
+            raise ValueError(f"target_col must be specified for '{mode}' mode")
+        pred_fields = set(ht.preds_missense.dtype.element_type.fields)
+        if target_col not in pred_fields:
+            raise ValueError(
+                f"target_col '{target_col}' not found in 'preds_missense' "
+                f"(fields: {sorted(pred_fields)})"
+            )
+        return lambda h: h.preds_missense
+
+    def compute_gene_missense_mean(ht, weight_array_expr, target_col):
+        # Gene-level mean of the *non-missing* raw missense scores, used to
+        # mean-impute variants whose score is missing. Genes with no scored
+        # missense variants at all get a mean of 0 (nothing to impute from).
+        missense_ht = ht.filter(is_missense_annotation_expr(ht))
+        scores_ht = missense_ht.select(
+            gene=gene_label(missense_ht),
+            raw_score=weight_array_expr(missense_ht).map(lambda w: hl.float64(w[target_col])),
+        ).explode('raw_score')
+        mean_ht = scores_ht.group_by('gene').aggregate(gene_mean=hl.agg.mean(scores_ht.raw_score))
+        return mean_ht.annotate(
+            gene_mean=hl.if_else(
+                hl.is_missing(mean_ht.gene_mean) | hl.is_nan(mean_ht.gene_mean),
+                hl.float64(0),
+                mean_ht.gene_mean,
+            )
+        )
+
+    def group_all_annotations(ht, weight_expr=None):
+        # Repeat each row's annotation label once per its own variant *before*
+        # grouping, since a gene can span several annotation categories here
+        # (unlike the flexRV branch, which groups missense/pLoF separately).
+        ht = ht.annotate(annotation_repeated=hl.map(lambda _: ht.annotation, ht.variants))
+        if weight_expr is not None:
+            ht = ht.annotate(weights=weight_expr(ht))
+        # Build agg exprs off the final `ht` only -- each `.annotate()` above
+        # returns a new table, and Hail requires agg exprs to share its source.
+        extra_aggs = {'annotation_repeated': hl.flatten(hl.agg.collect(ht.annotation_repeated))}
+        if weight_expr is not None:
+            extra_aggs['weights'] = hl.flatten(hl.agg.collect(ht.weights))
+        grouped = group_by_gene(ht, extra_aggs=extra_aggs)
+        return grouped.filter(hl.len(grouped.variants) >= MIN_VARIANTS)
+
+    def is_missense_annotation_expr(ht) -> hl.expr.BooleanExpression:
+        return hl.literal(MISSENSE_ANNOTATIONS).contains(ht.annotation)
+
+    def _hl_round(x: hl.expr.Float64Expression, ndigits: int = 3) -> hl.expr.Float64Expression:
+        factor = hl.float64(10 ** ndigits)
+        return hl.floor(x * factor + 0.5) / factor
+
+
+    gene_ht_path = f'{ANALYSIS_BUCKET}/data/utils/gene_map/{gene_map_source}/aou_{ancestry.upper()}_gene_map_processed_{TRANCHE}.ht'
     gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
 
-    if mode == 'unguided':
-        gene_ht = repeat_annotation(gene_ht)
-        var_ht = (gene_ht
-                  .select(gene=gene_label(gene_ht),tag='var',info=hl.delimit(gene_ht.variants, ' '))
-                  .add_index().key_by().drop('start'))
-        anno_ht = (gene_ht
-                   .select(gene=gene_label(gene_ht),tag='anno',info=gene_ht.annotation[:-1])
-                   .add_index().key_by().drop('start'))
+    if mode == 'weighted':
+        # No flexRV calibration: use the input weight directly for missense
+        # variants (mean-imputed at the gene level where missing and gene percentile transformed),
+        # and a fixed weight of 1 for every other annotation.
+        weight_array_expr = resolve_weight_array_expr(gene_ht, target_col)
+        gene_mean_ht = compute_gene_missense_mean(gene_ht, weight_array_expr, target_col)
 
-        finalize_and_export(var_ht, anno_ht, output_dir)
+        gene_ht = gene_ht.annotate(
+            gene_mean_score=hl.or_else(gene_mean_ht[gene_label(gene_ht)].gene_mean, hl.float64(0))
+        )
 
-    elif mode == 'agg':
-        if target_col is None:
-            raise ValueError("target_col must be specified for agg mode")
-
-        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
-        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
-
-        if target_col in scallion_fields:
-            weight_array_expr = lambda ht: ht.scallion_pred
-        elif target_col in vsms_fields:
-            weight_array_expr = lambda ht: ht.vsms
-        else:
-            raise ValueError(
-                f"target_col '{target_col}' not found in either 'scallion_pred' "
-                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
-                f"(fields: {sorted(vsms_fields)})."
+        def per_variant_weight(ht):
+            raw_weight = weight_array_expr(ht).map(
+                lambda w: hl.or_else(hl.float64(w[target_col]), ht.gene_mean_score)
             )
+            unit_weight = ht.variants.map(lambda _: hl.float64(1.0))
+            weight = hl.if_else(is_missense_annotation_expr(ht), raw_weight, unit_weight)
+            return weight.map(_hl_round)
 
-        plof_grouped = group_by_gene(gene_ht.filter(gene_ht.annotation == 'pLoF'))
+        grouped_ht = group_all_annotations(gene_ht, weight_expr=per_variant_weight)
 
-        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
-        missense_ht = missense_ht.annotate(
-            variants=hl.zip(missense_ht.variants, weight_array_expr(missense_ht))
-                .filter(lambda pair: pair[1][target_col] == 1)
-                .map(lambda pair: pair[0])
-        )
-        missense_grouped = group_by_gene(missense_ht)
+        var_ht = (grouped_ht
+            .select(tag='var', info=hl.delimit(grouped_ht.variants, ' '))
+            .key_by())
 
-        plof_grouped = repeat_annotation(plof_grouped)
-        missense_grouped = repeat_annotation(missense_grouped)
+        anno_ht = (grouped_ht
+            .select(tag='anno', info=hl.delimit(grouped_ht.annotation_repeated, ' '))
+            .key_by())
 
-        combined = plof_grouped.annotate(
-            variants=plof_grouped.variants.extend(
-                hl.or_else(missense_grouped[plof_grouped.gene].variants, hl.empty_array(hl.tstr))
-            ),
-            annotation=(
-                plof_grouped.annotation
-                + hl.or_else(missense_grouped[plof_grouped.gene].annotation, '')
-            )
-        )
-        combined = combined.filter(hl.len(combined.variants) > 0)
+        weight_ht = (grouped_ht
+            .select(tag='weight', info=hl.delimit(grouped_ht.weights.map(hl.str), ' '))
+            .key_by())
 
-        var_ht = (combined
-                .select(tag='var', info=hl.delimit(combined.variants, ' '))
-                .add_index().key_by())
-        anno_ht = (combined
-                .select(tag='anno', info=combined.annotation[:-1])
-                .add_index().key_by())
-
-        finalize_and_export(var_ht, anno_ht, output_dir)
-
-    elif mode == 'weighted':
-        if target_col is None:
-            raise ValueError("target_col must be specified for miss_weight mode")
-
-        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
-        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
-
-        if target_col in scallion_fields:
-            weight_array_expr = lambda ht: ht.scallion_pred
-        elif target_col in vsms_fields:
-            weight_array_expr = lambda ht: ht.vsms
-        else:
-            raise ValueError(
-                f"target_col '{target_col}' not found in either 'scallion_pred' "
-                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
-                f"(fields: {sorted(vsms_fields)})."
-            )
-
-        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
-        missense_ht = missense_ht.annotate(
-            weights=weight_array_expr(missense_ht).map(
-                lambda w: hl.str(hl.or_else(hl.float64(w[target_col]), hl.float64(0)))
-            )
+        finalize_and_export(
+            var_ht,
+            anno_ht,
+            weight_ht=weight_ht,
+            output_path = output_dir
         )
 
-        missense_grouped = group_by_gene(
-            missense_ht,
-            extra_aggs={'weights': hl.flatten(hl.agg.collect(missense_ht.weights))}
+    elif mode == 'unguided':
+        # No weights at all: group files carry only var and anno lines.
+        grouped_ht = group_all_annotations(gene_ht, weight_expr=None)
+
+        var_ht = (grouped_ht
+            .select(tag='var', info=hl.delimit(grouped_ht.variants, ' '))
+            .key_by())
+
+        anno_ht = (grouped_ht
+            .select(tag='anno', info=hl.delimit(grouped_ht.annotation_repeated, ' '))
+            .key_by())
+
+        finalize_and_export(
+            var_ht,
+            anno_ht,
+            weight_ht=None,
+            output_path = output_dir
         )
-        missense_grouped = repeat_annotation(missense_grouped)
-        missense_grouped = missense_grouped.filter(hl.len(missense_grouped.variants) > 0)
 
-        var_ht    = (missense_grouped
-                     .select(tag='var',    info=hl.delimit(missense_grouped.variants,  ' '))
-                     .add_index().key_by())
-        anno_ht   = (missense_grouped
-                     .select(tag='anno',   info=missense_grouped.annotation[:-1])
-                     .add_index().key_by())
-        weight_ht = (missense_grouped
-                     .select(tag='weight', info=hl.delimit(missense_grouped.weights, ' '))
-                     .add_index().key_by())
-
-        finalize_and_export(var_ht, anno_ht, output_dir, weight_ht)
-
-    elif mode == 'flexRV':
-        if target_col is None:
-            raise ValueError("target_col must be specified for flexRV mode")
-
-        scallion_fields = set(gene_ht.scallion_pred.dtype.element_type.fields)
-        vsms_fields     = set(gene_ht.vsms.dtype.element_type.fields)
-
-        if target_col in scallion_fields:
-            weight_array_expr = lambda ht: ht.scallion_pred
-        elif target_col in vsms_fields:
-            weight_array_expr = lambda ht: ht.vsms
-        else:
-            raise ValueError(
-                f"target_col '{target_col}' not found in either 'scallion_pred' "
-                f"(fields: {sorted(scallion_fields)}) or 'vsms' "
-                f"(fields: {sorted(vsms_fields)})."
-            )
-
-        missense_ht = gene_ht.filter(gene_ht.annotation == 'missenseother_missense')
-        missense_ht = missense_ht.annotate(
-            weights=weight_array_expr(missense_ht).map(
-                lambda w: hl.str(hl.or_else(hl.float64(w[target_col]), hl.float64(0)))
-            )
+    elif mode in GROUP_FILE_MODE_ALIASES:
+        raise ValueError(
+            f"Mode '{mode}' exports no group files of its own -- it reuses the "
+            f"'{GROUP_FILE_MODE_ALIASES[mode]}' group files. Export those with "
+            f"--saige-gene-mode {GROUP_FILE_MODE_ALIASES[mode]} instead."
         )
-        missense_grouped = group_by_gene(
-            missense_ht,
-            extra_aggs={
-                'weights': hl.flatten(hl.agg.collect(missense_ht.weights)),
-                'af':      hl.flatten(hl.agg.collect(missense_ht.AF)),
-            }
-        )
-        missense_grouped = repeat_annotation(missense_grouped)
-        missense_ht = annotate_flexrv_weights(
-            ht           = missense_grouped,
-            score_field  = 'weights',
-            maf_field    = 'af',
-            n_samples    = 100000,
-            is_lof_const = False,
-        ).drop('weights')
 
-        plof_ht = gene_ht.filter(gene_ht.annotation == 'pLoF')
-        plof_grouped = group_by_gene(
-            plof_ht,
-            extra_aggs={
-                'weights': hl.flatten(hl.agg.collect(hl.map(lambda _: hl.float64(1.0), plof_ht.AF))),
-                'af':      hl.flatten(hl.agg.collect(plof_ht.AF))
-            }
-        )
-        plof_grouped = repeat_annotation(plof_grouped)
-
-        plof_ht = annotate_flexrv_weights(
-            ht           = plof_grouped,
-            score_field  = 'weights',
-            maf_field    = 'af',
-            n_samples    = 100000,
-            is_lof_const = True,
-        ).drop('weights')
-
-        plof_renamed = plof_ht.rename({
-            'variants':     'plof_variants',
-            'annotation':   'plof_annotation',
-            'weight_matrix':'plof_weight_matrix',
-            'n_variants':   'plof_n_variants',
-            'af':           'plof_af',
-        })
-
-        combined_ht = missense_ht.join(plof_renamed, how='outer')
-        combined_ht = combined_ht.annotate(
-            variants=hl.or_else(combined_ht.variants,      hl.empty_array(hl.tstr))
-                      .extend(hl.or_else(combined_ht.plof_variants, hl.empty_array(hl.tstr))),
-            annotation=(
-                hl.or_else(combined_ht.annotation,     '')
-                + hl.or_else(combined_ht.plof_annotation, '')
-            ),
-            weight_matrix=hl.or_else(combined_ht.weight_matrix,      hl.empty_array(hl.tarray(hl.tfloat64)))
-                           .extend(hl.or_else(combined_ht.plof_weight_matrix, hl.empty_array(hl.tarray(hl.tfloat64)))),
-        )
-        combined_ht = combined_ht.drop(
-            'plof_variants', 'plof_annotation', 'plof_weight_matrix',
-            'plof_n_variants', 'plof_af', 'n_variants', 'af',
-        )
-        combined_ht = combined_ht.filter(hl.len(combined_ht.variants) > 0)
-
-        var_ht = (combined_ht
-                  .select(tag='var', info=hl.delimit(combined_ht.variants, ' '))
-                  .add_index().key_by())
-        anno_ht = (combined_ht
-                   .select(tag='anno', info=combined_ht.annotation[:-1])
-                   .add_index().key_by())
-
-        for k in range(N_WEIGHTS):
-            weight_ht = (combined_ht
-                         .select(
-                             tag='weight',
-                             info=hl.delimit(
-                                 combined_ht.weight_matrix.map(lambda wv: hl.str(wv[k])),
-                                 ' ',
-                             ),
-                         )
-                         .add_index().key_by())
-
-            finalize_and_export(var_ht, anno_ht, output_dir.replace(".txt", f"_w{k}.txt"), weight_ht)
     else:
-        raise ValueError(f"Unknown mode '{mode}'. Expected 'unguided', 'agg', 'weighted', or 'flexRV'.")
+        raise ValueError(
+            f"Unknown mode '{mode}'. Expected 'unguided' or 'weighted' "
+            f"(FlexRV modes are not ported to this pipeline)."
+        )
 
 
 
@@ -1526,14 +1403,24 @@ def main(args):
         variant_type = 'genome' if analysis_type == 'variant' else 'exome'
         print(f'Analysis type: {analysis_type}')
         print(f'Variant_type: {variant_type}')
-        print(f"Docker image: {SAIGE_DOCKER_IMAGE}...")
-        RESULT_ROOT = f'{ANALYSIS_BUCKET}/{analysis_type}_results'
+
+        # Image and group-file source both follow from the mode, so neither has to
+        # be switched by hand when moving between flexRV and the legacy no-weights run.
+        saige_docker_image = resolve_saige_docker_image(args.saige_gene_mode)
+        group_file_mode = resolve_group_file_mode(args.saige_gene_mode)
+        print(f"Docker image: {saige_docker_image}...")
+        if group_file_mode != args.saige_gene_mode:
+            print(f"Group files: reusing '{group_file_mode}' mode directory "
+                  f"(mode '{args.saige_gene_mode}' carries no weights)")
+
+        RESULT_ROOT = f'{RESULTS_PATH}/{analysis_type}_results'
+        EXTERNAL_RESULT_ROOT = f'{EXTERNAL_ANALYSIS_BUCKET}/{analysis_type}_results'
 
         for ancestry in ancestries:
             if not args.skip_bgen or not args.skip_saige:
                 N_GENE_PER_GROUP = 50 if ancestry=='all' else 100
                 size = CHUNK_SIZE[ancestry] if analysis_type == 'variant' else N_GENE_PER_GROUP
-                interval_ht_path = f'{DATA_PATH}/utils/intervals/aou_{analysis_type}_interval_size_{size}.ht'
+                interval_ht_path = f'{EXTERNAL_DATA_PATH}/utils/intervals/aou_{analysis_type}_interval_size_{size}.ht'
                 if not hfs.exists(interval_ht_path.replace('ht', 'pickle')):
                     interval_ht = hl.read_table(interval_ht_path)
                     interval_ht = interval_ht.filter(interval_ht.interval.start.contig != "chrM")
@@ -1571,7 +1458,7 @@ def main(args):
             b = hb.Batch(
                 name=f"saige_{analysis_type}_aou_{ancestry}",
                 backend=backend,
-                default_image=SAIGE_DOCKER_IMAGE,
+                default_image=saige_docker_image,
                 default_storage="500Mi",
                 default_cpu=n_threads,
             )
@@ -1580,7 +1467,7 @@ def main(args):
             relatedness_cutoff = "0.125"
             num_markers = 2000
             n_threads = 8
-            sparse_grm_root = f"{DATA_PATH}/utils/grm/aou_{ancestry}"
+            sparse_grm_root = f"{EXTERNAL_DATA_PATH}/utils/grm/aou_{ancestry}"
             sparse_grm_extension = f"_relatednessCutoff_{relatedness_cutoff}_{num_markers}_randomMarkersUsed.sparseGRM.mtx"
             sparse_grm = b.read_input_group(
                 **{ext: f"{sparse_grm_root}.{ext}"
@@ -1588,7 +1475,7 @@ def main(args):
             )
 
             overwrite_null_models = args.overwrite_null_models
-            null_model_dir = f'{RESULT_ROOT}/null_glmm/{ancestry.upper()}'
+            null_model_dir = f'{EXTERNAL_RESULT_ROOT}/null_glmm/{ancestry.upper()}'
             null_models_already_created = {}
             null_models = {}
             pheno_exports = {}
@@ -1625,7 +1512,7 @@ def main(args):
                     else:
                         raise ValueError(f"Unknown trait type for {phenoname}")
 
-                    pheno_file = b.read_input(f'{ANALYSIS_BUCKET}/pheno_file/{ancestry.upper()}/phenotype_{phenoname}.tsv')
+                    pheno_file = b.read_input(f'{EXTERNAL_ANALYSIS_BUCKET}/pheno_file/{ancestry.upper()}/phenotype_{phenoname}.tsv')
                     pheno_exports[phenoname] = pheno_file
 
                     if (
@@ -1647,8 +1534,8 @@ def main(args):
                             pheno_file=pheno_exports[phenoname],
                             trait_type=current_trait_type,
                             covariates=covariates,
-                            plink_file_root=f'{DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink',
-                            docker_image=SAIGE_DOCKER_IMAGE,
+                            plink_file_root=f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink',
+                            docker_image=saige_docker_image,
                             variant_type=variant_type,
                             sparse_grm=sparse_grm,
                             sparse_grm_extension=sparse_grm_extension,
@@ -1673,18 +1560,25 @@ def main(args):
 
             if not args.skip_bgen or not args.skip_saige:
                 print(f"------------{ancestry.upper()} {analysis_type} analysis bgen files------------")
-                bgen_dir = f'{RESULT_ROOT}/bgen/{ancestry.upper()}'
+                bgen_dir = f'{EXTERNAL_RESULT_ROOT}/bgen/{ancestry.upper()}'
+
+                if args.saige_gene_weight is None:
+                    amc_bgen_dir = f"{RESULT_ROOT}/bgen/{args.saige_gene_map_source}/{group_file_mode}/{ancestry.upper()}"
+                else:
+                    amc_bgen_dir = f"{RESULT_ROOT}/bgen/{args.saige_gene_map_source}/{group_file_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
+
                 print(f'bgen directory: {bgen_dir}')
+                print(f'amc group files directory: {amc_bgen_dir}')
                 overwrite_bgens = args.overwrite_bgens
                 overwrite_groupfile = args.overwrite_gene_txt
                 bgens_already_created = {}
                 groupfile_already_created = {}
-                
+
                 if not overwrite_bgens and hfs.exists(bgen_dir):
                     bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".bgen")}
                 print(f'Found {len(bgens_already_created)} Bgens in directory...')
-                if not overwrite_groupfile and hfs.exists(bgen_dir):
-                    groupfile_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".txt")}
+                if not overwrite_groupfile and hfs.exists(amc_bgen_dir):
+                    groupfile_already_created = {x["path"] for x in hl.hadoop_ls(amc_bgen_dir) if x["path"].endswith(".txt")}
                 print(f'Found {len(groupfile_already_created)} groupFiles in directory...')
 
                 bgens = {}
@@ -1703,6 +1597,9 @@ def main(args):
             if not args.skip_bgen:
                 for interval in intervals:
                     bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+                    amc_bgen_root = f"{amc_bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+                    amc_group_file_root = f"{amc_bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+
                     if (f"{bgen_root}.bgen" not in bgens_already_created) or args.overwrite_bgens:
                         bgen_task = b.new_python_job(
                             name=f"{analysis_type}_analysis_export_{str(interval)}_bgen_{ancestry}"
@@ -1717,7 +1614,7 @@ def main(args):
                             ancestry=ancestry,
                             analysis_type=analysis_type,
                             interval=interval,
-                            output_dir=bgen_dir,
+                            output_dir=amc_bgen_dir,
                             log_file=bgen_task.log_file,
                             mean_impute_missing=True,
                             variant_ac_filter= args.variant_ac_filter,
@@ -1730,23 +1627,36 @@ def main(args):
                         bgen_index = index_bgen(b=b,
                                                 ancestry=ancestry,
                                                 analysis_type=analysis_type,
-                                                bgen=f"{bgen_root}.bgen",
+                                                bgen=f"{amc_bgen_root}.bgen",
                                                 depend_job=bgen_task)
                         bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
-                    if ((f"{bgen_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
+
+                    # An alias mode owns no group files of its own -- amc_bgen_dir points
+                    # at the aliased mode's directory, so exporting here would overwrite
+                    # that mode's files (and export_gene_group_file has no branch for the
+                    # alias name anyway). Regenerate them via the aliased mode instead.
+                    if group_file_mode != args.saige_gene_mode and analysis_type == 'gene':
+                        if args.overwrite_gene_txt:
+                            logger.warning(
+                                f"--overwrite-gene-txt ignored for mode "
+                                f"'{args.saige_gene_mode}': it reuses the "
+                                f"'{group_file_mode}' group files. Re-export with "
+                                f"--saige-gene-mode {group_file_mode}."
+                            )
+                    elif ((f"{amc_group_file_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
                         gene_txt_task = b.new_python_job(
                             name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
                         )
                         gene_txt_task.image(HAIL_DOCKER_IMAGE)
-                        
-                        
                         gene_txt_task.call(
                             export_gene_group_file,
                             interval=interval,
                             ancestry=ancestry,
-                            output_dir=f"{bgen_root}.gene.txt",
-                            weight_saige_gene = args.weight_saige_gene
+                            mode = args.saige_gene_mode,
+                            target_col = args.saige_gene_weight,
+                            gene_map_source = args.saige_gene_map_source,
+                            output_dir=f"{amc_group_file_root}.gene.txt",
                         )
                         gene_txt_task.attributes["ancestry"] = ancestry
                         gene_txt_task.attributes["analysis_type"] = analysis_type
@@ -1765,7 +1675,7 @@ def main(args):
                         }
                     )
                     if analysis_type == 'gene':
-                        group_file = b.read_input(f"{bgen_root}.gene.txt")
+                        group_file = b.read_input(f"{amc_group_file_root}.gene.txt")
                         bgens[str(interval)] = (bgen_file, group_file)
                     else:
                         bgens[str(interval)] = bgen_file
@@ -1773,6 +1683,7 @@ def main(args):
             elif not args.skip_saige:
                 for interval in intervals:
                     bgen_root = f"{bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+                    amc_group_file_root = f"{amc_bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
                     bgen_file = b.read_input_group(
                         **{
                             "bgen": f"{bgen_root}.bgen",
@@ -1781,13 +1692,16 @@ def main(args):
                         }
                     )
                     if analysis_type == 'gene':
-                        group_file = b.read_input(f"{bgen_root}.gene.txt")
+                        group_file = b.read_input(f"{amc_group_file_root}.gene.txt")
                         bgens[str(interval)] = (bgen_file, group_file)
                     else:
                         bgens[str(interval)] = bgen_file
 
 
-            result_dir = f'{RESULT_ROOT}/result/{ancestry.upper()}'
+            if args.saige_gene_weight is None:
+                result_dir = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}"
+            else:
+                result_dir = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
             print(f'result directory: {result_dir}')
             overwrite_results = args.overwrite_results
             saige_tasks = {}
@@ -1857,7 +1771,7 @@ def main(args):
                             sparse_grm_file = sparse_grm[sparse_grm_extension]
                         else:
                             bgen_file = bgens[str(interval)]
-                        samples_file = b.read_input(f'{DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
+                        samples_file = b.read_input(f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
 
                         if (
                             overwrite_results
@@ -1874,7 +1788,7 @@ def main(args):
                                 sparse_grm_file=sparse_grm_file,
                                 bgen_file=bgen_file,
                                 samples_file=samples_file,
-                                docker_image=SAIGE_DOCKER_IMAGE,
+                                docker_image=saige_docker_image,
                                 group_file=group_file,
                                 groups=groups,
                                 trait_type=current_trait_type,
@@ -1910,7 +1824,7 @@ def main(args):
                                     sparse_grm_file=None,
                                     bgen_file=bgen_file,
                                     samples_file=samples_file,
-                                    docker_image=SAIGE_DOCKER_IMAGE,
+                                    docker_image=saige_docker_image,
                                     group_file=None,
                                     groups=None,
                                     trait_type=current_trait_type,
@@ -1934,15 +1848,23 @@ def main(args):
 
             if not args.skip_load_hail_results:
                 results_type = 'ACAF' if analysis_type == 'variant' else 'Exome'
-                root = f'{ANALYSIS_BUCKET}/ht_results/{ancestry.upper()}'
+                if args.saige_gene_weight is None:
+                    root = f"{RESULTS_PATH}/ht_results/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}"
+                else:
+                    root = f"{RESULTS_PATH}/ht_results/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
+
                 print(f'--------------Loading results from {results_type} analysis [{ancestry.upper()}]: {root}------------')
                 for i in tqdm(range(len(phenos_to_run))):
                     phenoname = list(phenos_to_run)[i]
                     if phenoname in gate_traits and not ancestry in phenoname:
                         continue
-                    directory = f'{ANALYSIS_BUCKET}/{analysis_type}_results/result/{ancestry.upper()}/phenotype_{phenoname}'
+                    if args.saige_gene_weight is None:
+                        directory = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}/phenotype_{phenoname}"
+                    else:
+                        directory = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}/phenotype_{phenoname}"
+
                     output_ht_directory = f'{root}/phenotype_{phenoname}'
-                    null_glmm_log = f'{ANALYSIS_BUCKET}/{analysis_type}_results/null_glmm/{ancestry.upper()}/phenotype_{phenoname}.log'
+                    null_glmm_log = f'{EXTERNAL_ANALYSIS_BUCKET}/{analysis_type}_results/null_glmm/{ancestry.upper()}/phenotype_{phenoname}.log'
 
                     saige_log = f'{directory}/result_{phenoname}_chr1_{"000065419" if analysis_type == "gene" else "000000001"}.{analysis_type}.log'
 
@@ -1959,11 +1881,12 @@ def main(args):
                             j.memory('standard')
                             j.cpu(16)
                             j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 8g --executor-memory 8g pyspark-shell')
+                            gene_ht_map_path = f'{ANALYSIS_BUCKET}/data/utils/gene_map/{args.saige_gene_map_source}/aou_{ancestry.upper()}_gene_map_v8.ht'
                             j.call(load_gene_data,
                                    directory=directory,
                                    output_ht_directory=output_ht_directory,
                                    phenoname=phenoname,
-                                   gene_ht_map_path=get_aou_gene_map_ht_path(pop=ancestry, processed=False),
+                                   gene_ht_map_path=gene_ht_map_path,
                                    quantitative_trait=quantitative_trait,
                                    null_glmm_log=null_glmm_log,
                                    saige_log=saige_log,
@@ -2100,11 +2023,22 @@ if __name__ == "__main__":
         default="pLoF,missenseLC,synonymous,pLoF:missenseLC",
     )
     parser.add_argument(
-        "--weight-saige-gene",
-        help="Comma-separated list of VSMs used for variant weighting in gene-based test ",
+        "--saige-gene-weight",
+        help="Name of weight to use for Saige gene",
         default=None,
     )
-    
+    parser.add_argument(
+        "--saige-gene-mode",
+        help="Mode to create gene groups that will be used for saige analysis",
+        default='unguided',
+    )
+    parser.add_argument(
+        "--saige-gene-map-source",
+        help="Which processed gene map ht to use for gene-based group files",
+        choices=sorted(GENE_MAP_SOURCES),
+        default='brava',
+    )
+
     parser.add_argument(
         "--ancestries", help="comma-separated list", default="afr,amr,eas,eur,mid,sas"
     )

@@ -2,62 +2,118 @@
 
 import sys
 import os
+import ast
 import argparse
+import json
 import hail as hl
-import hailtop.batch as hb
 import hailtop.fs as hfs
+import gcsfs
+import pickle
+import pandas as pd
+import joblib
+
+from pyspark.sql import SparkSession
 
 # Global constants
 MY_BUCKET = 'gs://aou_amc'
 TMP_BUCKET = 'gs://aou_tmp'
-
 TRANCHE = "v8"
-ANALYSIS_BUCKET = "gs://aou_amc_analyses/"
+ANALYSIS_BUCKET = "gs://aou_amc_analyses"
 EXTERNAL_ANALYSIS_BUCKET = "gs://aou_analysis/"
-DATA_PATH = f"{ANALYSIS_BUCKET}/brava_annot/data"
+DATA_PATH = f"{ANALYSIS_BUCKET}/data"
 EXTERNAL_DATA_PATH = f"gs://aou_analysis/{TRANCHE}/data"
+SNPINDEL_OUT_PATH = f'{EXTERNAL_DATA_PATH}/vep/aou_{TRANCHE}_vep_full.ht'
+SNPINDEL_AMC_PATH = f'{ANALYSIS_BUCKET}/data/vep/aou_{TRANCHE}_vep_full.ht'
 
-SNPINDEL_OUT_PATH = f'{DATA_PATH}/aou_{TRANCHE}_vep_full.ht'
-SNP_BRAVA_VAT_OUT = f'{DATA_PATH}/aou_{TRANCHE}_snp_vep_brava.ht'
+BRAVA_PATH = 'gs://aou_amc_analyses/data/utils/brava_annot/brava.ht'
 
+ALL_MIS_VSM_SCALLION = f"{ANALYSIS_BUCKET}/data/utils/missense_predictions/all_missense_w_predictions_w_pct.parquet"
 
-def initialize_hail(batch_mode=False, log_file="/hail_operation.log", app_name=None):
-    init_params = {
-        "tmp_dir": TMP_BUCKET,
-        "gcs_requester_pays_configuration": "aou-neale-gwas",
-        "default_reference": "GRCh38",
-        "log": log_file
-    }
-    
-    if app_name:
-        init_params["app_name"] = app_name
-        
-    if batch_mode:
-        init_params.update({
-            "master": "local[32]",
-            "worker_cores": 8,
-            "worker_memory": "highmem"
-        })
-    
-    hl.init(**init_params)
-
-
-def merge_data(merge_type='snp_indel', overwrite=False, batch_mode=False):
+def load_predictions_missense(path: str) -> hl.Table:
+    """Read a predictions parquet file into an annotated, keyed Hail Table,
+    with all '_pct' columns grouped into a 'preds_missense' struct.
+    Parameters
+    ----------
+    path : str
+        GCS (or other) path to the predictions parquet file, e.g.
     """
-    Unified function to merge data based on merge_type
-    
-    Args:
-        merge_type: 'snp_indel' for SNP-INDEL union or 'brava' for BRAVA-SNP-VAT intersection
-        overwrite: Whether to overwrite existing files
-        batch_mode: Whether running in batch mode
-    """
-    
-    if batch_mode:
-        log_file = f"/merge_{merge_type}_ht.log"
-        initialize_hail(batch_mode=batch_mode, log_file=log_file)
+    spark = SparkSession.builder.getOrCreate()
+    spark_df = spark.read.parquet(path)
+    pred_ht = hl.Table.from_spark(spark_df)
 
+    pred_ht = pred_ht.annotate(
+        locus=hl.locus(pred_ht.chrom, hl.int32(pred_ht.pos), reference_genome='GRCh38'),
+        alleles=hl.array([pred_ht.ref, pred_ht.alt]),
+    )
+
+    pred_ht = pred_ht.key_by('locus', 'alleles', 'ensg')
+
+    pct_cols = [f for f in pred_ht.row.dtype.fields if f.endswith('_pct')]
+    pred_ht = pred_ht.annotate(preds_missense=hl.struct(**{c: pred_ht[c] for c in pct_cols}))
+    pred_ht = pred_ht.drop(*pct_cols)
+
+    ht_path = path.replace('.parquet', '.ht')
+    print(f"Checkpointing missense predictions table to {ht_path}...")
+    pred_ht = pred_ht.checkpoint(ht_path)
+
+    return pred_ht
+
+def create_brava_ht(overwrite: bool = False) -> hl.Table:
+    """
+    Build the BRaVa annotation Hail Table: import the per-chromosome
+    variant files, union them, key by locus/alleles, and write the
+    result to BRAVA_PATH.
+    """
+    chromosomes = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10',
+                   '11', '12', '13', '14', '15', '16', '17', '18', '19', '20',
+                   '21', '22', 'X']
+
+    tables = []
+    for chrom in chromosomes:
+        file_path = f'{DATA_PATH}/utils/brava_annot/brava_split_chr/aou.v8.chr{chrom}.variants_only.spliceai=0.20_cadd=28.1_revel=0.773.canonical.txt.gz'
+        ht_chr = hl.import_table(
+            file_path,
+            delimiter='\t',
+            impute=True,
+            comment='#',
+            force=True  # Required for regular gzip files
+        )
+        # Optionally add chromosome info if not in the data
+        ht_chr = ht_chr.annotate(chromosome=chrom)
+        tables.append(ht_chr)
+
+    ht_combined = tables[0]
+    for table in tables[1:]:
+        ht_combined = ht_combined.union(table)
+
+    ht_combined = ht_combined.annotate(
+        id_parts=ht_combined.ID.split(':')
+    )
+    ht_combined = ht_combined.annotate(
+        locus=hl.locus(
+            ht_combined.id_parts[0],
+            hl.int32(ht_combined.id_parts[1])
+        ),
+        alleles=hl.array([
+            ht_combined.id_parts[2],
+            ht_combined.id_parts[3]
+        ])
+    )
+    ht_combined = ht_combined.drop('id_parts')
+    ht_combined = ht_combined.key_by('locus', 'alleles')
+
+    print("Table schema after setting keys:")
+    print(ht_combined.describe())
+
+    ht_combined = ht_combined.naive_coalesce(500)
+
+    print(f"Writing BRaVa table to {BRAVA_PATH}...")
+    ht_combined = ht_combined.checkpoint(BRAVA_PATH, overwrite=overwrite)
+
+    return ht_combined
+
+def snp_indel_vep_concat(output_path, overwrite=False):
     from gnomad.utils.vep import process_consequences
-    
     snp_vep_path = 'gs://gcp-public-data--gnomad/resources/context/grch38_context_vep_annotated.v105.ht'
     snp_vep_ht = hl.read_table(snp_vep_path).naive_coalesce(3000)
     shared_fields_to_drop = ['uniparc', 'trembl', 'swissprot']
@@ -73,108 +129,71 @@ def merge_data(merge_type='snp_indel', overwrite=False, batch_mode=False):
             transcript_consequences=snp_ht.vep.transcript_consequences.map(
                 lambda x: x.drop(*shared_fields_to_drop, 'minimised')),
         ))
-    
-    if merge_type == 'snp_indel':
-        indel_vep_path = f'{EXTERNAL_ANALYSIS_BUCKET}/{TRANCHE}/data/vep/aou_vds_variant_data_row_{TRANCHE}_vep.ht'
-        indel_vep_ht = hl.read_table(indel_vep_path)
-        indel_fields_to_drop = ['ancestral', 'context']
-        print("Processing INDEL VEP annotations...")
-        indel_ht = indel_vep_ht.annotate(vep=indel_vep_ht.vep.drop('minimised'))
-        indel_ht = indel_ht.annotate(
-            vep=indel_ht.vep.annotate(
-                intergenic_consequences=indel_ht.vep.intergenic_consequences.map(
-                    lambda x: x.drop(*indel_fields_to_drop)),
-                motif_feature_consequences=indel_ht.vep.motif_feature_consequences.map(
-                    lambda x: x.drop(*indel_fields_to_drop)),
-                regulatory_feature_consequences=indel_ht.vep.regulatory_feature_consequences.map(
-                    lambda x: x.drop(*indel_fields_to_drop)),
-                transcript_consequences=indel_ht.vep.transcript_consequences.map(
-                    lambda x: x.drop(*shared_fields_to_drop, *indel_fields_to_drop)),
-            ))
-        print("Merging SNP and INDEL VEP annotations...")
-        merged_ht = snp_ht.union(indel_ht, unify=True)
-        output_path = SNPINDEL_OUT_PATH
-        
-    elif merge_type == 'brava':
-        brava_path = 'gs://aou_amc_analyses/brava_annot/data/brava_annot_processed_v2.ht'
-        brava_ht = hl.read_table(brava_path).naive_coalesce(2000)
-        vat_aou_path = 'gs://aou_analysis/v8/data/vat/aou_PARSED_SORTED_COLLECTED_vat_v8.ht/'
-        vat_aou = hl.read_table(vat_aou_path).naive_coalesce(3000)
-        
-        print("Performing three-way intersection: BRAVA, SNP, and VAT AoU...")
-        brava_snp_ht = brava_ht.join(snp_ht, how='inner')
-        print(f"STEP1 - BRAVA-SNP intersection complete. Variants: {brava_snp_ht.count()}")
-        
-        print("Processing VAT data...")
-        fields_to_keep = ['revel'] + [
-            f for f in vat_aou.values.dtype.element_type.fields if f.startswith('splice_ai')
-            ]
-        sub_vat = vat_aou.annotate(
-            aou_vat_annot=hl.struct(**{f: vat_aou.values[0][f] for f in fields_to_keep})
-        )
-        sub_vat = sub_vat.checkpoint(f'{DATA_PATH}/variant_annot_processed.ht', _read_if_exists=True)
-        print("VAT data processing complete...")
 
-        print("STEP2 - Adding VAT AoU data to the intersection...")
-        merged_ht = brava_snp_ht.join(sub_vat, how='inner')
-        print(f"STEP2 - Final three-way intersection complete. Variants: {merged_ht.count()}")
-        output_path = SNP_BRAVA_VAT_OUT
-    else:
-        raise ValueError(f"Invalid merge_type: {merge_type}. Must be 'brava' or 'snp_indel'")
+    indel_vep_path = f'{EXTERNAL_DATA_PATH}/vep/aou_vds_variant_data_row_{TRANCHE}_vep.ht'
+    indel_vep_ht = hl.read_table(indel_vep_path)
+    indel_fields_to_drop = ['ancestral', 'context']
+    print("Processing INDEL VEP annotations...")
+    indel_ht = indel_vep_ht.annotate(vep=indel_vep_ht.vep.drop('minimised'))
+    indel_ht = indel_ht.annotate(
+        vep=indel_ht.vep.annotate(
+            intergenic_consequences=indel_ht.vep.intergenic_consequences.map(
+                lambda x: x.drop(*indel_fields_to_drop)),
+            motif_feature_consequences=indel_ht.vep.motif_feature_consequences.map(
+                lambda x: x.drop(*indel_fields_to_drop)),
+            regulatory_feature_consequences=indel_ht.vep.regulatory_feature_consequences.map(
+                lambda x: x.drop(*indel_fields_to_drop)),
+            transcript_consequences=indel_ht.vep.transcript_consequences.map(
+                lambda x: x.drop(*shared_fields_to_drop, *indel_fields_to_drop)),
+        ))
+    print("Merging SNP and INDEL VEP annotations...")
     
-    print("Adding process_consequences annotations...")
+    merged_ht = snp_ht.union(indel_ht, unify=True)
+    
     process_vep_ht = process_consequences(merged_ht)
     merged_ht = merged_ht.annotate(
         worst_csq_by_gene_canonical=process_vep_ht[merged_ht.key].vep.worst_csq_by_gene_canonical
     )
-
-    if merge_type == 'brava':
-        merged_ht = merged_ht.annotate(
-            values=merged_ht.values.map(
-                lambda val: val.annotate(
-                    worst_csq_by_gene_canonical=hl.find(
-                        lambda x: x.transcript_id == val.TRANSCRIPT,
-                        merged_ht.worst_csq_by_gene_canonical))))
-        merged_ht = merged_ht.drop('worst_csq_by_gene_canonical')
-
-    print(f"Writing merged table to {output_path}...")
-    merged_ht = merged_ht.naive_coalesce(2500)
-    merged_ht = merged_ht.checkpoint(output_path, overwrite=overwrite)
+    
+    merged_ht = merged_ht.naive_coalesce(5000)
+    print(f"Writing merged VEP table to {SNPINDEL_OUT_PATH}...")
+    merged_ht = merged_ht.checkpoint(SNPINDEL_OUT_PATH, overwrite=overwrite)
+    
+    if overwrite:
+        merged_ht = merged_ht.checkpoint(output_path, overwrite=overwrite)
     
     return merged_ht
 
-
-def create_raw_gene_map(pop: str, annot_type: str, overwrite: bool = False, batch_mode=False):
+def create_raw_gene_map(pop: str, annot_type: str, overwrite: bool = False, overwrite_report: bool = False, overwrite_context: bool = False):
     """
     Create raw gene mapping file for a specific ancestry population.
-    
+
     Args:
         pop: Ancestry population code (e.g., 'AFR', 'EUR')
         annot_type: Annotation type ('snp_indel' or 'brava')
         overwrite: Whether to overwrite existing files
-        batch_mode: Whether the function is being run in a batch job
+        overwrite_report: Whether to overwrite the snpindel/missingness report files
+        overwrite_context: Whether to regenerate the merged snp+indel VEP context table
     """
     from annotations import create_gene_map_ht
 
-    if batch_mode:
-        initialize_hail(batch_mode=batch_mode, log_file=f"/create_raw_gene_map_{pop}.log")
-    
-    # Load VEP table
-    snp_indel_vep_path = SNPINDEL_OUT_PATH if annot_type == 'snp_indel' else SNP_BRAVA_VAT_OUT
+    if not hl.hadoop_exists(SNPINDEL_OUT_PATH) or overwrite_context:
+        print(f"SNP+indel VEP table not found at {SNPINDEL_OUT_PATH} (or overwrite_context=True), generating it...")
+        snp_indel_vep_ht = snp_indel_vep_concat(SNPINDEL_AMC_PATH, overwrite=overwrite_context)
+    else:
+        snp_indel_vep_ht = hl.read_table(SNPINDEL_OUT_PATH)
+    snp_indel_vep_ht = snp_indel_vep_ht.key_by('locus', 'alleles')
 
-    try:
-        snp_indel_vep_ht = hl.read_table(snp_indel_vep_path)
-        print(snp_indel_vep_ht.count())
-        snp_indel_vep_ht.show()
-    except:
-        pass
-        
-    gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/aou_{pop}_gene_map_{TRANCHE}.ht"
+    gene_map_subdir = 'brava' if annot_type == 'brava' else 'gnomad_context'
+    gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/{gene_map_subdir}/aou_{pop.upper()}_gene_map_{TRANCHE}.ht"
     if not overwrite and hl.hadoop_exists(gene_map_ht_path):
-        print(f"Raw gene map file already exists for {pop} and overwrite=False. Skipping creation.")
+        print(f"Raw gene map file already exists for {pop.upper()} and overwrite=False. Skipping creation.")
         return
+
+    report_dir = f"{DATA_PATH}/utils/gene_map/{gene_map_subdir}/report"
+    report_prefix = f"{report_dir}/aou_{pop.upper()}_{TRANCHE}"
     
-    call_stats_ht_path = f"{EXTERNAL_DATA_PATH}/utils/call_stats/exome_pruned/{pop}_exome_call_stats.ht"
+    call_stats_ht_path = f"{EXTERNAL_DATA_PATH}/utils/call_stats/exome_pruned/{pop.upper()}_exome_call_stats.ht"
     print(f"Loading call stats from {call_stats_ht_path}...")
     call_stats_ht = hl.read_table(call_stats_ht_path)
     call_stats_ht = call_stats_ht.filter(call_stats_ht.call_stats.AC[1] > 0)
@@ -205,171 +224,132 @@ def create_raw_gene_map(pop: str, annot_type: str, overwrite: bool = False, batc
     snp_indel_vep_ht = snp_indel_vep_ht.annotate(
         freq = call_stats_ht[snp_indel_vep_ht.key].call_stats.AF[1]
     )
+
+    print(f'count before handling call stats for {pop.upper()} {snp_indel_vep_ht.count()}')
     snp_indel_vep_ht = snp_indel_vep_ht.filter(
         hl.is_defined(snp_indel_vep_ht.freq)
     )
+
+    snp_indel_vep_ht = snp_indel_vep_ht.explode(snp_indel_vep_ht.worst_csq_by_gene_canonical)
+    snp_indel_vep_ht = snp_indel_vep_ht.annotate(
+        ensg=snp_indel_vep_ht.worst_csq_by_gene_canonical.gene_id
+    )
+    snp_indel_vep_ht = snp_indel_vep_ht.filter(
+        snp_indel_vep_ht.worst_csq_by_gene_canonical.gene_id.startswith('ENSG')
+    )
+    snp_indel_vep_ht = snp_indel_vep_ht.key_by('locus', 'alleles', 'ensg')
+
+    tmp_filtered_vep_path = f"{DATA_PATH}/utils/gene_map/tmp/aou_{pop.upper()}_snp_indel_vep_filtered_{TRANCHE}.ht"
+    print(f"Checkpointing call-stats-filtered VEP table to {tmp_filtered_vep_path}...")
+    snp_indel_vep_ht = snp_indel_vep_ht.checkpoint(
+        tmp_filtered_vep_path, overwrite=overwrite, _read_if_exists=not overwrite
+    )
+
+    # Get missense variant weights
+    all_mis_preds_ht_path = ALL_MIS_VSM_SCALLION.replace('.parquet', '.ht')
+    if hl.hadoop_exists(all_mis_preds_ht_path):
+        print(f"Missense predictions table already exists at {all_mis_preds_ht_path}, loading it directly.")
+        all_mis_preds = hl.read_table(all_mis_preds_ht_path)
+    else:
+        all_mis_preds = load_predictions_missense(ALL_MIS_VSM_SCALLION)
+    snp_indel_vep_ht = snp_indel_vep_ht.annotate(
+        preds_missense=all_mis_preds[snp_indel_vep_ht.key].preds_missense
+    )
     
-    gene_map_ht = create_gene_map_ht(snp_indel_vep_ht, annot_type, freq_field='freq')
+    print(f'count after handling call stats for {pop.upper()} {snp_indel_vep_ht.count()}')
+    if annot_type == 'brava':
+        if not hl.hadoop_exists(BRAVA_PATH) or overwrite:
+            print(f"BRaVa table not found at {BRAVA_PATH} (or overwrite=True), generating it...")
+            brava_ht = create_brava_ht(overwrite=overwrite)
+        else:
+            brava_ht = hl.read_table(BRAVA_PATH)
+            brava_ht = brava_ht.rename({'GENE': 'ensg'})
+            brava_ht = brava_ht.key_by('locus', 'alleles', 'ensg')
+
+            snp_indel_vep_ht = snp_indel_vep_ht.annotate(
+                brava=brava_ht[snp_indel_vep_ht.key]
+            )
+    
+    gene_map_ht = create_gene_map_ht(
+        snp_indel_vep_ht, annot_type, freq_field='freq',
+        report_prefix=report_prefix,
+        overwrite_report=overwrite_report,
+    )
     print(f'---------Exporting raw gene mapping HT ({pop.upper()})-----------------')
     gene_map_ht.checkpoint(gene_map_ht_path, overwrite=overwrite)
-    print(f"Raw gene map for {pop} saved to {gene_map_ht_path}")
+    print(f"Raw gene map for {pop.upper()} saved to {gene_map_ht_path}")
+    
     return gene_map_ht_path
 
-
-def process_gene_map(pop: str, overwrite: bool = False, batch_mode=False):
+def process_gene_map(pop: str, annot_type: str, overwrite: bool = False):
     """
     Process gene mapping file for a specific ancestry population.
-    
+
     Args:
         pop: Ancestry population code (e.g., 'AFR', 'EUR')
+        annot_type: Annotation type ('snp_indel' or 'brava')
         overwrite: Whether to overwrite existing files
-        batch_mode: Whether the function is being run in a batch job
     """
     from annotations import post_process_gene_map_ht
 
-    if batch_mode:
-        initialize_hail(batch_mode=batch_mode, log_file=f"/process_gene_map_{pop}.log")
-    
-    gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/aou_{pop}_gene_map_{TRANCHE}.ht"
-    processed_gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/aou_{pop}_gene_map_processed_{TRANCHE}.ht"
-    
+    gene_map_subdir = 'brava' if annot_type == 'brava' else 'gnomad_context'
+    gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/{gene_map_subdir}/aou_{pop.upper()}_gene_map_{TRANCHE}.ht"
+    processed_gene_map_ht_path = f"{DATA_PATH}/utils/gene_map/{gene_map_subdir}/aou_{pop.upper()}_gene_map_processed_{TRANCHE}.ht"
+
     if not overwrite and hl.hadoop_exists(processed_gene_map_ht_path):
-        print(f"Processed gene map file already exists for {pop} and overwrite=False. Skipping processing.")
+        print(f"Processed gene map file already exists for {pop.upper()} and overwrite=False. Skipping processing.")
         return
     
     if not hl.hadoop_exists(gene_map_ht_path):
-        raise FileNotFoundError(f"Raw gene map file does not exist for {pop}. Run create_raw_gene_map first.")
+        raise FileNotFoundError(f"Raw gene map file does not exist for {pop.upper()}. Run create_raw_gene_map first.")
     
     print(f"Loading raw gene map from {gene_map_ht_path}...")
     gene_map_ht = hl.read_table(gene_map_ht_path)
-    gene_map_ht = post_process_gene_map_ht(gene_map_ht, freq_cutoff=0.01)
+
+
+    gene_map_ht = post_process_gene_map_ht(gene_map_ht, freq_cutoff=0.01, annot_type=annot_type)
+    print(f'---------Adding VSM weights and SCALLION predictions({pop.upper()})-----------------')
+    # gene_map_ht = add_top_decile_annotations(gene_map_ht)
     print(f'---------Exporting processed gene mapping HT ({pop.upper()})-----------------')
     gene_map_ht = gene_map_ht.checkpoint(processed_gene_map_ht_path, overwrite=overwrite)
     gene_map_ht.describe()
     gene_map_ht.show()
-    print(f'Completed processing for ancestry: {pop}')
+    print(f'Completed processing for ancestry: {pop.upper()}')
     return processed_gene_map_ht_path
 
 
 def main(args):
-    """
-    Main function that runs the merged pipeline:
-    1. Merge SNP and INDEL VEP annotations OR BRAVA intersection based on annotation type
-    2. Create and process gene mapping files for specified ancestries
-    
-    Args:
-        args: Command-line arguments
-    """
+    hl.init(
+        tmp_dir=TMP_BUCKET,
+        gcs_requester_pays_configuration="aou-neale-gwas",
+        default_reference="GRCh38",
+        log=f"/gene_map_generation_{TRANCHE}.log",
+    )
+
     try:
-        if args.batch:
-            backend = hb.ServiceBackend(
-                billing_project="all-by-aou",
-                remote_tmpdir=TMP_BUCKET,
-            )
-            b = hb.Batch(
-                name=f"aou_{TRANCHE}_pipeline",
-                requester_pays_project="aou-neale-gwas",
-                default_python_image="amartinezcarrasco/hailgnomad:latest",
-                backend=backend,
-            )
-            
-            if args.merge:
-                merge_job = b.new_python_job(name=f"Merge {args.annotation_type}")
-                merge_job.memory('highmem')
-                merge_job.cpu(8)
-                merge_job.call(merge_data, args.annotation_type, args.overwrite, True)
-                
-                if args.gene_map and args.ancestries:
-                    for pop in args.ancestries:
-                        job = b.new_python_job(name=f"gene_map_{pop}")
-                        job.depends_on(merge_job)
-                        job.attributes['ancestry'] = pop
-                        
-                        if not args.skip_raw_gene_map_file:
-                            job.call(create_raw_gene_map, pop, args.annotation_type, args.overwrite, True)
-                        job.call(process_gene_map, pop, args.overwrite, True)
-            
-            elif args.gene_map and args.ancestries:
-                for pop in args.ancestries:
-                    job = b.new_python_job(name=f"gene_map_{pop}")
-                    job.attributes['ancestry'] = pop
-                    
-                    if not args.skip_raw_gene_map_file:
-                        job.call(create_raw_gene_map, pop, args.annotation_type, args.overwrite, True)
-                    job.call(process_gene_map, pop, args.overwrite, True)
-            
-            b.run()
-            
-        else:
-            # Run on dataproc cluster or locally with QoB
-            initialize_hail(log_file=f"/gene_map_generation_{TRANCHE}.log")
-            if args.merge:
-                print(f"Running {args.annotation_type} merge...")
-                vep_merged_ht = merge_data(args.annotation_type, args.overwrite)
-            
-            if args.gene_map and args.ancestries:
-                for pop in args.ancestries:
-                    print(f"Processing ancestry {pop}")
-                    if not args.skip_raw_gene_map_file:
-                        create_raw_gene_map(pop, args.annotation_type, args.overwrite)
-                    process_gene_map(pop, args.overwrite)
+        for pop in args.ancestries:
+            print(f"Processing ancestry {pop}")
+            if not args.process_only:
+                create_raw_gene_map(pop, args.annotation_type, args.overwrite, args.overwrite_report, args.overwrite_context)
+            process_gene_map(pop, args.annotation_type, args.overwrite)
     finally:
-        if not args.batch:
-            from datetime import date
-            hl.copy_log(f"{MY_BUCKET}/pipeline_{TRANCHE}_{date.today()}.log")
+        from datetime import date
+        hl.copy_log(f"{MY_BUCKET}/pipeline_{TRANCHE}_{date.today()}.log")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AoU VEP and Gene Map Processing Pipeline")
-    
-    parser.add_argument(
-        "--batch",
-        help="Run with Hail Batch",
-        action="store_true",
-    )
-    
-    parser.add_argument(
-        "--merge",
-        help="Run merge operation",
-        action="store_true",
-    )
-    
-    parser.add_argument(
-        "--annotation-type",
-        help="Type of annotation to use: 'brava' for BRAVA intersection or 'snp_indel' for SNP-INDEL merge",
-        choices=['brava', 'snp_indel'],
-        default='snp_indel',
-        type=str
-    )
-    
-    parser.add_argument(
-        "--gene-map",
-        help="Create and process gene mapping files",
-        action="store_true",
-    )
-    
-    parser.add_argument(
-        "--overwrite",
-        help="Overwrite existing files",
-        action="store_true"
-    )
-    
-    parser.add_argument(
-        "--ancestries",
-        help="Comma-separated list of ancestries to process (e.g., 'EUR,AFR,AMR')",
-        type=lambda s: s.split(',')
-    )
-    
-    parser.add_argument(
-        "--skip-raw-gene-map-file",
-        help="Skip creating raw gene map file (only process existing files)",
-        action="store_true"
-    )
-    
+    parser.add_argument("--overwrite",         help="Overwrite existing raw/processed gene map files",                                     action="store_true")
+    parser.add_argument("--overwrite-report",  help="Overwrite existing report files (snpindel formatted HT + missingness report)",         action="store_true")
+    parser.add_argument("--overwrite-context", help="Regenerate the merged snp+indel VEP context table even if it already exists",          action="store_true")
+    parser.add_argument("--process-only",      help="Skip raw gene map creation and go straight to processing (raw gene map must already exist)", action="store_true")
+    parser.add_argument("--annotation-type",   help="Type of annotation", choices=["brava", "snp_indel"], default="snp_indel", type=str)
+    parser.add_argument("--ancestries",        help="Comma-separated ancestries to process (e.g., 'EUR,AFR,AMR')", type=lambda s: s.split(","))
+
     args = parser.parse_args()
-    
-    if args.gene_map and not args.ancestries:
-        args.ancestries = ['EUR', 'AFR', 'AMR', 'EAS', 'SAS', 'MID']
+
+    if not args.ancestries:
+        args.ancestries = ["EUR", "AFR", "AMR", "EAS", "SAS", "MID"]
         print(f"No ancestries specified, using defaults: {', '.join(args.ancestries)}")
-    
+
     main(args)
