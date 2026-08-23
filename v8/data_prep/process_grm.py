@@ -75,15 +75,15 @@ def annotate_adj(
    )
 
 
-def get_filtered_mt(mt_type: hl.tstr,
+def get_filtered_mt(mt_type: str,
                     sample_ids: hl.Table,
                     ancestry: str='all',
                     filter_samples: bool=True, 
                     filter_variants: bool=True,
                     prune_samples:bool=True,
                     adj_filter: bool=True):
+    anc_mt_path = f'{DATA_PATH}/utils/raw_mt/{mt_type}/{ancestry.upper()}_{mt_type}.mt'
     if ancestry != 'all':
-        anc_mt_path = f'{DATA_PATH}/utils/raw_mt/{mt_type}/{ancestry.upper()}_{mt_type}.mt'
         ancestry_ht = hl.read_table(f'{DATA_PATH}/utils/aou_v8_global_pca.ht')
         ancestry_ht = ancestry_ht.filter(ancestry_ht.ancestry_pred == ancestry)
         if not hfs.exists(f'{anc_mt_path}/_SUCCESS'):
@@ -98,9 +98,12 @@ def get_filtered_mt(mt_type: hl.tstr,
         mt = hl.read_matrix_table(anc_mt_path)
         print(mt.count())
     else:
-        mt_path = ACAF_MT_PATH if mt_type=='ACAF' else EXOME_MT_PATH
-        mt = hl.read_matrix_table(mt_path)
-        mt = mt.filter_entries(hl.is_missing(mt.FT) | (mt.FT == 'PASS'))
+        if not hfs.exists(f'{anc_mt_path}/_SUCCESS'):
+            mt_path = ACAF_MT_PATH if mt_type=='ACAF' else EXOME_MT_PATH
+            mt = hl.read_matrix_table(mt_path)
+            mt = mt.filter_entries(hl.is_missing(mt.FT) | (mt.FT == 'PASS'))
+            mt = mt.naive_coalesce(20000).checkpoint(anc_mt_path, overwrite=True)
+        mt = hl.read_matrix_table(anc_mt_path)
         print(mt.count())
 
     if filter_variants:
@@ -113,7 +116,7 @@ def get_filtered_mt(mt_type: hl.tstr,
         print(f'Filtering to samples with sex, ancestry defined and age <= 100...')
         mt = mt.filter_cols(hl.is_defined(sample_ids[mt.col_key]))
         
-    if prune_samples:
+    if prune_samples and ancestry != 'all':
         print(f'[{mt_type}] Filtering to samples pruned from the PCA centroid pipeline...')
         pca_pruned_sample_tsv = f'{DATA_PATH}/utils/pca/results/aou_{ancestry.lower()}_centroid_pruned.tsv'
         pca_pruned_sample_path = f'{DATA_PATH}/utils/pca/results/{ancestry.lower()}_pca_centroid_pruned.ht'
@@ -273,7 +276,9 @@ def main(args):
             gcs_requester_pays_configuration='aou-neale-gwas',
             tmp_dir=f"{TMP_BUCKET}/grm",
             default_reference="GRCh38",
-            log="/process_grm.log"
+            log="/process_grm.log",
+            spark_conf={'spark.rpc.message.maxSize': '1024'},
+            regions = ['us-central1']
         )
 
         sample_ids = hl.read_table(f'{DATA_PATH}/utils/aou_v8_hard_filter.ht')
@@ -345,13 +350,14 @@ def main(args):
         mt = hl.read_matrix_table(grm_mt_path)
         print(f'-------------{ANCESTRY.upper()} MT entering LD-pruning: {mt.count()}-------------')
         mt = mt.unfilter_entries()
+        mt = mt.naive_coalesce(400).checkpoint(grm_mt_path.replace('.mt', '_repartitioned.mt'), overwrite=True)
         grm_ld_pruned_variant_path = f'{DATA_PATH}/utils/grm/{ANCESTRY.upper()}_ld_pruned_variants.ht'
         print(f"-------------Exporting the LD pruned downsampled variant HT (Ancestry: {ANCESTRY.upper()})-----------")
         if not hfs.exists(f'{grm_ld_pruned_variant_path}/_SUCCESS') or args.overwrite_ld_pruned_ht:
             ld_prune_ht = hl.ld_prune(mt.GT,
                             r2=0.1,
-                            bp_window_size=int(1e7),
-                            block_size=1024,
+                            bp_window_size=int(1e7) if ANCESTRY.upper() != 'ALL' else int(1e6),
+                            block_size=4096,
                             )
             ld_prune_ht = ld_prune_ht.checkpoint(
                 grm_ld_pruned_variant_path,
@@ -379,8 +385,8 @@ def main(args):
         print(f"-------------Exporting GRM (Ancestry: {ANCESTRY.upper()})-----------")
         sparse_grm_root = f"{DATA_PATH}/utils/grm/aou_{ANCESTRY.lower()}"
         grm_plink_path = f'{DATA_PATH}/utils/grm/{ANCESTRY.upper()}_grm_plink'
-        relatedness_cutoff = "0.125"
-        num_markers = 2000
+        relatedness_cutoff = "0.125" if ANCESTRY.upper() != 'ALL' else "0.2"
+        num_markers = 2000 if ANCESTRY.upper() != 'ALL' else 1000
         n_threads = 16
 
         backend = hb.ServiceBackend(

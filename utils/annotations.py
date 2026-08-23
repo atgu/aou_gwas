@@ -89,7 +89,7 @@ def create_gene_map_ht(snpindel_ht, annot_type, freq_field=None, check_gene_cont
         if freq_field is not None:
             ht = ht.annotate(_af=ht[freq_field])
             fields.append('_af')
-        
+
         ht = ht.annotate(
             variant_id=ht.locus.contig + ':' + hl.str(ht.locus.position) + ':' + ht.alleles[0] + ':' + ht.alleles[1],
             annotation=annotation_case_builder(ht, annot_type))
