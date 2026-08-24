@@ -385,18 +385,20 @@ def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:
         else:
             ht = ht.key_by('gene_id', 'gene_symbol', 'annotation')
             ht = ht.annotate(max_MAF=hl.if_else(hl.is_missing(ht.max_MAF), -1, ht.max_MAF))
+            # Which Pvalue* columns exist depends on --r.corr (Burden-only vs SKAT-O):
+            # read them off the table instead of assuming all three are present.
+            p_value_fields = [f for f in ht.row_value if f.startswith('Pvalue') and not f.endswith('_log10')]
+            if not p_value_fields:
+                raise ValueError(f"No Pvalue* column found in {path}")
             for max_MAF in [0.01, 0.001, 0.0001, -1]:
                 tag = 'Cauchy' if max_MAF == -1 else str(max_MAF)
                 sub_ht = ht.filter(ht.max_MAF == max_MAF)
-                sub_ht = annotate_expected_pvalue(ht=sub_ht, method=method, p_field='Pvalue')
-                sub_ht = annotate_expected_pvalue(ht=sub_ht, method=method, p_field='Pvalue_Burden')
-                sub_ht = annotate_expected_pvalue(ht=sub_ht, method=method, p_field='Pvalue_SKAT')
+                for p_field in p_value_fields:
+                    sub_ht = annotate_expected_pvalue(ht=sub_ht, method=method, p_field=p_field)
                 sub_ht.describe()
                 sub_ht = sub_ht.transmute_globals(**{f'lambda_gc_maxmaf_{tag}':
-                                                    hl.struct(lambda_gc_Pvalue = sub_ht.lambda_gc_Pvalue,
-                                                            lambda_gc_Pvalue_Burden=sub_ht.lambda_gc_Pvalue_Burden,
-                                                            lambda_gc_Pvalue_SKAT=sub_ht.lambda_gc_Pvalue_SKAT,
-                                                            )})
+                                                    hl.struct(**{f'lambda_gc_{p_field}': sub_ht[f'lambda_gc_{p_field}']
+                                                                  for p_field in p_value_fields})})
                 sub_ht = sub_ht.checkpoint(path.replace('.ht', f'_{method}_expected_p_{tag}.ht'), overwrite=overwrite,
                                     _read_if_exists=not overwrite)
                 sub_ht.export(path.replace('.ht', f'_{method}_expected_p_{tag}.txt.bgz'))
@@ -411,6 +413,22 @@ def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:
             ht = ht.checkpoint(path.replace('.ht', f'_{method}_expected_p.ht'), overwrite=overwrite,
                                     _read_if_exists=not overwrite)
     return ht
+
+def discover_pvalue_fields(directory: str) -> list:
+    """The Pvalue* columns this run's raw SAIGE output actually contains.
+
+    SAIGE's own column set follows from --r.corr (and from the SAIGE build in
+    use) and has changed over time -- e.g. the SKAT-O combined column was
+    renamed Pvalue -> Pvalue_ACATO and Pvalue_ACATV was added. Read the header
+    instead of hardcoding a mapping that can silently drift out of sync with
+    whatever SAIGE build produced these files.
+    """
+    matches = hfs.ls(f'{directory}/*.gene.txt')
+    if not matches:
+        raise ValueError(f"No *.gene.txt files found under {directory}")
+    with hfs.open(matches[0].path) as f:
+        header = f.readline().strip().split('\t')
+    return [c for c in header if c.startswith('Pvalue') and not c.endswith('_log10')]
 
 def load_gene_data(directory: str,
                    output_ht_directory: str,
@@ -482,9 +500,15 @@ def load_gene_data(directory: str,
     saige_version = get_saige_version_from_log(null_glmm_log) if null_glmm_log else 'NA'
     output_ht_path = f'{output_ht_directory}/gene_results.ht'
     print(f'Loading: {directory}/*.gene.txt ...')
+
+    p_value_fields = discover_pvalue_fields(directory)
+    if not p_value_fields:
+        raise ValueError(f"No Pvalue* column found in {directory}/*.gene.txt")
+    print(f'P-value columns found in {directory}: {p_value_fields}')
+
     types = {x: hl.tint32 for x in ('MAC',	'Number_rare', 'Number_ultra_rare')}
     types.update({x: hl.tfloat64 for x in ('max_MAF', 'BETA_Burden', 'SE_Burden')})
-    types.update({x: hl.tstr for x in ('Pvalue', 'Pvalue_Burden', 'Pvalue_SKAT')})
+    types.update({x: hl.tstr for x in p_value_fields})
     if not phenoname.endswith('male'):
         single_variant_ht = hl.import_table(f'{directory}/result_{phenoname}_chr1_000065419.result.singleAssoc.txt', delimiter='\t', impute=True, types = {'p.value':hl.tstr})
     else:
@@ -504,8 +528,8 @@ def load_gene_data(directory: str,
     if saige_version == 'NA': saige_version = hl.null(hl.tstr)
     if inv_normalized == 'NA': inv_normalized = hl.null(hl.tstr)
 
-    ht = ht.annotate(**{f'{p_field}_log10': parse_log_p_value(ht[p_field]) for p_field in ('Pvalue', 'Pvalue_Burden', 'Pvalue_SKAT')})
-    ht = ht.annotate(**{f'{p_field}': hl.float64(ht[p_field]) for p_field in ('Pvalue', 'Pvalue_Burden', 'Pvalue_SKAT')})
+    ht = ht.annotate(**{f'{p_field}_log10': parse_log_p_value(ht[p_field]) for p_field in p_value_fields})
+    ht = ht.annotate(**{f'{p_field}': hl.float64(ht[p_field]) for p_field in p_value_fields})
     fields = ht.Region.split('_')
     gene_ht = hl.read_table(gene_ht_map_path).select('interval').distinct()
     ht = ht.key_by(gene_id=fields[0], gene_symbol=fields[1], annotation=ht.Group, phenoname=phenoname, max_MAF=ht.max_MAF).drop('Region', 'Group').naive_coalesce(10).annotate_globals(
@@ -698,6 +722,7 @@ def run_saige(
     storage: str = "10Gi",
     add_suffix: str = "",
     pgen: bool = False,
+    r_corr: float = 1.0,
 ):
     """
     Change log:
@@ -759,6 +784,11 @@ def run_saige(
         f"--is_fastTest=FALSE "
         f"--is_noadjCov=FALSE "
     )
+    if analysis_type == "gene":
+        # Only meaningful for set-based tests: selects Burden-only vs SKAT-O in
+        # step2_SPAtests.R. Whatever Pvalue_* columns that produces are discovered
+        # from the output header in load_gene_data() rather than hardcoded here.
+        command += f"--r.corr={r_corr} "
     if not pgen:
         command += f"--bgenFile={geno_file.bgen} " 
         command += f'--bgenFileIndex={geno_file["bgen.bgi"]} '
@@ -1440,7 +1470,7 @@ def main(args):
     
 
     if args.export_phenos or (not args.skip_saige) or (not args.skip_any_null_models) or (not args.skip_load_hail_results) or (not args.skip_bgen):
-        all_phenos_by_group = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_dict_raw.dict')
+        all_phenos_by_group = read_pickle_dict(f'{EXTERNAL_DATA_PATH}/phenotype/summary/pheno_dict_raw.dict')
         print(f'----------Number of phenotypes per category (RAW): --------------')
         print([(category, len(all_phenos_by_group[category])) for category in all_phenos_by_group.keys()])
 
@@ -1483,8 +1513,8 @@ def main(args):
             if len(phenos_to_run) < 20:
                 print(phenos_to_run_by_ancestry)
         else: 
-            phenos_to_run_by_ancestry = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_by_ancestry_dict_{args.sex}.dict')
-            phenos_to_run_by_ancestry_by_group = read_pickle_dict(f'{DATA_PATH}/phenotype/summary/pheno_by_ancestry_by_group_dict_{args.sex}.dict')
+            phenos_to_run_by_ancestry = read_pickle_dict(f'{EXTERNAL_DATA_PATH}/phenotype/summary/pheno_by_ancestry_dict_{args.sex}.dict')
+            phenos_to_run_by_ancestry_by_group = read_pickle_dict(f'{EXTERNAL_DATA_PATH}/phenotype/summary/pheno_by_ancestry_by_group_dict_{args.sex}.dict')
             if 'all' not in ancestries:
                 print(f'----------Number of phenotypes per category per ancestry for {args.sex} (filtered to n_cases >= 200): --------------')
                 print([f"{ancestry.upper()}-{category}: {len(phenos_to_run_by_ancestry_by_group[ancestry][category])}" for ancestry in ancestries for category in list(all_phenos_by_group.keys())])
@@ -1587,6 +1617,9 @@ def main(args):
         saige_docker_image = resolve_saige_docker_image(args.saige_gene_mode)
         group_file_mode = resolve_group_file_mode(args.saige_gene_mode)
         print(f"Docker image: {saige_docker_image}...")
+        if analysis_type == 'gene':
+            print(f"Set-based test: --r.corr={args.r_corr} "
+                  f"(p-value columns discovered from output header at load time)")
         if group_file_mode != args.saige_gene_mode:
             print(f"Group files: reusing '{group_file_mode}' mode directory "
                   f"(mode '{args.saige_gene_mode}' carries no weights)")
@@ -2022,7 +2055,7 @@ def main(args):
                             sparse_grm_file = sparse_grm[sparse_grm_extension]
                         else:
                             geno_file = genos[str(interval)]
-                        samples_file = b.read_input(f'{DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
+                        samples_file = b.read_input(f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
 
                         if (
                             overwrite_results
@@ -2052,6 +2085,7 @@ def main(args):
                                 memory=memory,
                                 storage=storage,
                                 pgen=args.pgen,
+                                r_corr=args.r_corr,
                             )
                             saige_task.attributes.update(
                                 {"interval": str(interval), "ancestry": ancestry, 'name': f'saige{analysis_type == "gene"}'}
@@ -2633,6 +2667,14 @@ if __name__ == "__main__":
         help="Impose filter of specified variant AC (default: 0) when exporting bgen",
         default=0,
         type=int,
+    )
+    parser.add_argument(
+        "--r-corr",
+        help="SAIGE --r.corr for the set-based test: 1 = Burden only (emits Pvalue_Burden), "
+             "0 = SKAT-O (emits Pvalue, Pvalue_Burden, Pvalue_SKAT). Also selects which "
+             "p-value columns the results loader expects. Gene analyses only",
+        default=1.0,
+        type=float,
     )
     parser.add_argument(
         "--max-maf-group",
