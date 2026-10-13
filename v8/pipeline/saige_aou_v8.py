@@ -53,7 +53,7 @@ ACAF_MT_PATH = ''
 EXOME_MT_PATH = ''
 
 
-SAIGE_DOCKER_IMAGE = "us-central1-docker.pkg.dev/aou-neale-gwas/saige/saige.multiweights:SKATO"
+SAIGE_DOCKER_IMAGE = "us-central1-docker.pkg.dev/aou-neale-gwas/saige/saige.multiweights:saige_multiweights"
 LEGACY_SAIGE_MODE = "legacy_saige_no_weights"
 SAIGE_DOCKER_IMAGE_BY_MODE = {
     LEGACY_SAIGE_MODE: "wzhou88/saige:1.5.1"

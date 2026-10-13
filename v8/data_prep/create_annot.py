@@ -239,7 +239,7 @@ def create_raw_gene_map(pop: str, annot_type: str, overwrite: bool = False, over
     )
     snp_indel_vep_ht = snp_indel_vep_ht.key_by('locus', 'alleles', 'ensg')
 
-    tmp_filtered_vep_path = f"{DATA_PATH}/utils/gene_map/tmp/{gene_map_subdir}/aou_{pop.upper()}_snp_indel_vep_filtered_{TRANCHE}.ht"
+    tmp_filtered_vep_path = f"{DATA_PATH}/utils/gene_map/tmp/aou_{pop.upper()}_snp_indel_vep_filtered_{TRANCHE}.ht"
     print(f"Checkpointing call-stats-filtered VEP table to {tmp_filtered_vep_path}...")
     snp_indel_vep_ht = snp_indel_vep_ht.checkpoint(
         tmp_filtered_vep_path, overwrite=overwrite, _read_if_exists=not overwrite
@@ -263,7 +263,7 @@ def create_raw_gene_map(pop: str, annot_type: str, overwrite: bool = False, over
             brava_ht = create_brava_ht(overwrite=overwrite)
         else:
             brava_ht = hl.read_table(BRAVA_PATH)
-
+        
         brava_ht = brava_ht.rename({'GENE': 'ensg'})
         brava_ht = brava_ht.key_by('locus', 'alleles', 'ensg')
 
