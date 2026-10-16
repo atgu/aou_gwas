@@ -74,6 +74,22 @@ def resolve_group_file_mode(mode: str) -> str:
     return GROUP_FILE_MODE_ALIASES.get(mode, mode)
 
 
+THRESHOLD_MODE_DIR = "threshold"
+
+
+def resolve_mode_subdir(mode: str, weight: str = None, top_pct: float = None) -> str:
+    """Path segment under `<map_source>/` for group files, results and hail tables.
+
+    A top-pct threshold run writes under `threshold/` instead of `<mode>/`: its group
+    files carry no weight lines, so they must never be mixed up with the weighted ones.
+    """
+    if top_pct is not None:
+        return f"{THRESHOLD_MODE_DIR}/{weight.upper()}/top_pct_{top_pct:g}"
+    if weight is None:
+        return mode
+    return f"{mode}/{weight.upper()}"
+
+
 HAIL_DOCKER_IMAGE = "hailgenetics/hail:0.2.133-py3.11"
 QQ_DOCKER_IMAGE = "konradjk/saige_qq:0.2"
 
@@ -1049,13 +1065,16 @@ def export_bgen_from_mt(
 
 
 
-def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_dir):
+def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_dir,
+                           top_pct=None):
     MIN_VARIANTS = 2
     MISSENSE_ANNOTATIONS = {'missenseother_missense', 'missenseLC'}
-    
+
 
     if gene_map_source not in GENE_MAP_SOURCES:
         raise ValueError(f"gene_map_source must be one of {sorted(GENE_MAP_SOURCES)}, got '{gene_map_source}'")
+    if top_pct is not None and mode != 'weighted':
+        raise ValueError(f"top_pct is only supported in 'weighted' mode, got mode '{mode}'")
 
     hl.init(
         master='local[*]',
@@ -1175,7 +1194,56 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
     gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
 
-    if mode == 'weighted':
+    if mode == 'weighted' and top_pct is not None:
+        # Threshold variant of 'weighted': target_col only *selects* missense variants,
+        # it is not written out, so the group file has var/anno lines and no weight line.
+        #
+        # Thresholding is per gene. The *_pct columns are already within-gene percentile
+        # ranks in [0, 1] (utils/percentiles.py, ranked over every scored missense variant
+        # of the gene), so "top `top_pct` of the gene" is a fixed cut on the value:
+        # pct > 1 - top_pct. No ranking or aggregation is needed here, and the cut does
+        # not depend on how the interval chunking splits genes.
+        #
+        # Missense variants with no score are dropped rather than gene-mean-imputed: an
+        # imputed score carries no evidence of being in the top tail. Every
+        # non-missense annotation (pLoF, synonymous, ...) is kept unconditionally.
+        weight_array_expr = resolve_weight_array_expr(gene_ht, target_col)
+        min_pct = round(1.0 - top_pct, 12)
+
+        def keep_mask(ht):
+            passes = weight_array_expr(ht).map(lambda w: hl.or_else(hl.float64(w[target_col]) > min_pct, False))
+            keep_all = ht.variants.map(lambda _: True)
+            return hl.if_else(
+                is_missense_annotation_expr(ht),
+                hl.or_else(passes, ht.variants.map(lambda _: False)),
+                keep_all,
+            )
+
+        gene_ht = gene_ht.annotate(
+            variants=hl.zip(gene_ht.variants, keep_mask(gene_ht))
+                       .filter(lambda vk: vk[1])
+                       .map(lambda vk: vk[0])
+        )
+        gene_ht = gene_ht.filter(hl.len(gene_ht.variants) > 0)
+
+        grouped_ht = group_all_annotations(gene_ht, weight_expr=None)
+
+        var_ht = (grouped_ht
+            .select(tag='var', info=hl.delimit(grouped_ht.variants, ' '))
+            .key_by())
+
+        anno_ht = (grouped_ht
+            .select(tag='anno', info=hl.delimit(grouped_ht.annotation_repeated, ' '))
+            .key_by())
+
+        finalize_and_export(
+            var_ht,
+            anno_ht,
+            weight_ht=None,
+            output_path = output_dir
+        )
+
+    elif mode == 'weighted':
         # No flexRV calibration: use the input weight directly for missense
         # variants (mean-imputed at the gene level where missing and gene percentile transformed),
         # and a fixed weight of 1 for every other annotation.
@@ -1624,6 +1692,22 @@ def main(args):
             print(f"Group files: reusing '{group_file_mode}' mode directory "
                   f"(mode '{args.saige_gene_mode}' carries no weights)")
 
+        if args.saige_gene_top_pct is not None:
+            if args.saige_gene_mode != 'weighted':
+                raise ValueError(
+                    f"--saige-gene-top-pct is only supported with --saige-gene-mode weighted, "
+                    f"got '{args.saige_gene_mode}'"
+                )
+            if args.saige_gene_weight is None:
+                raise ValueError("--saige-gene-top-pct needs --saige-gene-weight to threshold on")
+            if not 0 < args.saige_gene_top_pct <= 1:
+                raise ValueError(f"--saige-gene-top-pct must be in (0, 1], got {args.saige_gene_top_pct}")
+            print(f"Thresholding: keeping missense variants in the top {args.saige_gene_top_pct:g} "
+                  f"of their gene by {args.saige_gene_weight}; group files carry no weight lines")
+
+        group_file_subdir = resolve_mode_subdir(group_file_mode, args.saige_gene_weight, args.saige_gene_top_pct)
+        result_subdir = resolve_mode_subdir(args.saige_gene_mode, args.saige_gene_weight, args.saige_gene_top_pct)
+
         RESULT_ROOT = f'{RESULTS_PATH}/{software_type}{analysis_type}_results{"" if not args.misc_test else "_misc"}'
         EXTERNAL_RESULT_ROOT = f'{EXTERNAL_ANALYSIS_BUCKET}/{software_type}{analysis_type}_results{"" if not args.misc_test else "_misc"}'
 
@@ -1791,10 +1875,7 @@ def main(args):
                 geno_dir = f'{EXTERNAL_RESULT_ROOT.replace("gate_", "")}/{folder}/{ancestry.upper()}'
                 bgen_dir = f'{EXTERNAL_RESULT_ROOT.replace("gate_", "")}/bgen/{ancestry.upper()}'
 
-                if args.saige_gene_weight is None:
-                    amc_bgen_dir = f"{RESULT_ROOT}/bgen/{args.saige_gene_map_source}/{group_file_mode}/{ancestry.upper()}"
-                else:
-                    amc_bgen_dir = f"{RESULT_ROOT}/bgen/{args.saige_gene_map_source}/{group_file_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
+                amc_bgen_dir = f"{RESULT_ROOT}/bgen/{args.saige_gene_map_source}/{group_file_subdir}/{ancestry.upper()}"
 
                 pgen_dir = f'{EXTERNAL_RESULT_ROOT.replace("gate_", "")}/pgen/{ancestry.upper()}'
                 print(f'{folder} directory: {geno_dir}')
@@ -1898,6 +1979,7 @@ def main(args):
                             target_col = args.saige_gene_weight,
                             gene_map_source = args.saige_gene_map_source,
                             output_dir=f"{amc_group_file_root}.gene.txt",
+                            top_pct=args.saige_gene_top_pct,
                         )
                         gene_txt_task.attributes["ancestry"] = ancestry
                         gene_txt_task.attributes["analysis_type"] = analysis_type
@@ -1971,10 +2053,7 @@ def main(args):
                         genos[str(interval)] = geno_file
 
 
-            if args.saige_gene_weight is None:
-                result_dir = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}"
-            else:
-                result_dir = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
+            result_dir = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{result_subdir}/{ancestry.upper()}"
             print(f'result directory: {result_dir}')
             overwrite_results = args.overwrite_results
             saige_tasks = {}
@@ -2138,20 +2217,14 @@ def main(args):
 
             if not args.skip_load_hail_results:
                 results_type = 'ACAF' if analysis_type == 'variant' else 'Exome'
-                if args.saige_gene_weight is None:
-                    root = f"{RESULTS_PATH}/ht_results/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}"
-                else:
-                    root = f"{RESULTS_PATH}/ht_results/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}"
+                root = f"{RESULTS_PATH}/ht_results/{args.saige_gene_map_source}/{result_subdir}/{ancestry.upper()}"
 
                 print(f'--------------Loading results from {results_type} analysis [{ancestry.upper()}]: {root}------------')
                 for i in tqdm(range(len(phenos_to_run))):
                     phenoname = list(phenos_to_run)[i]
                     if phenoname in gate_traits and not ancestry in phenoname:
                         continue
-                    if args.saige_gene_weight is None:
-                        directory = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{ancestry.upper()}/phenotype_{phenoname}{sex_tag}"
-                    else:
-                        directory = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{args.saige_gene_mode}/{args.saige_gene_weight.upper()}/{ancestry.upper()}/phenotype_{phenoname}{sex_tag}"
+                    directory = f"{RESULT_ROOT}/result/{args.saige_gene_map_source}/{result_subdir}/{ancestry.upper()}/phenotype_{phenoname}{sex_tag}"
                     output_ht_directory = f'{root}/phenotype_{phenoname}{sex_tag}'
                     null_glmm_log = f'{EXTERNAL_RESULT_ROOT}/null_glmm/{ancestry.upper()}/phenotype_{phenoname}{sex_tag}.log'
 
@@ -2640,6 +2713,18 @@ if __name__ == "__main__":
         help="Which processed gene map ht to use for gene-based group files",
         choices=sorted(GENE_MAP_SOURCES),
         default='brava',
+    )
+    parser.add_argument(
+        "--saige-gene-top-pct",
+        type=float,
+        default=None,
+        help=(
+            "Only with --saige-gene-mode weighted. Keep only missense variants in the top "
+            "fraction of their gene by --saige-gene-weight (a within-gene percentile, so "
+            "0.1 keeps pct > 0.9); unscored missense variants are dropped and all other "
+            "annotations are kept. The weight is used only for filtering: the group files "
+            "have no weight line. Outputs go under threshold/<WEIGHT>/top_pct_<x>/."
+        ),
     )
 
     parser.add_argument(
