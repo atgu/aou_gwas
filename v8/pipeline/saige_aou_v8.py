@@ -5,9 +5,12 @@ __author__ = "wlu"
 import hail as hl
 import copy
 import math
+import os
 import sys
 from collections import Counter
+import numpy as np
 import pandas as pd
+from scipy.stats import cauchy
 import pickle
 import argparse
 import logging
@@ -446,6 +449,176 @@ def discover_pvalue_fields(directory: str) -> list:
         header = f.readline().strip().split('\t')
     return [c for c in header if c.startswith('Pvalue') and not c.endswith('_log10')]
 
+
+# --------------------------------------------------------------------------------------------------
+# Per-group Cauchy combination
+# --------------------------------------------------------------------------------------------------
+GROUP_CAUCHY_FILE = 'gene_results_cauchy_by_group.tsv.gz'
+CCT_EXCLUDE_FROM_ALL = ('synonymous',)
+CCT_GROUP_WEIGHTS = {'pLoF': ('Beta_1_25',)}
+# Weight label given to rows of a SAIGE build that writes no Weight column (legacy, unweighted runs
+# use the default Beta(1,25) weights)
+DEFAULT_SAIGE_WEIGHT = 'Beta_1_25'
+SIGN_P = 0.05
+GROUP_CAUCHY_REQUIRED_COLS = ('Pvalue_cct_pos', 'Pvalue_cct_neg', 'n_pos_nom', 'n_neg_nom')
+
+
+def _cauchy_t(p):
+    """Per-test Cauchy contribution tan((0.5-p)pi), with the 1/(p pi) small-p limit."""
+    p = np.clip(np.asarray(p, dtype=float), 1e-300, 1 - 1e-15)
+    small = p < 1e-16
+    return np.where(small, 1 / (np.where(small, p, 1) * np.pi), np.tan((0.5 - p) * np.pi))
+
+
+def _cauchy_p(T):
+    """Equal-weight CCT p from the mean Cauchy statistic."""
+    T = np.asarray(T, dtype=float)
+    return np.where(T > 1e15, 1 / (np.where(T > 1e15, T, 1) * np.pi), cauchy.sf(T))
+
+
+def read_gene_txt_tests(paths, p_field: str = 'Pvalue_Burden') -> pd.DataFrame:
+    """Per-test rows (Cauchy rows dropped) of SAIGE *.gene.txt files, tagged with their chunk.
+
+    Read sequentially: hailtop.fs binds its client session to one asyncio loop, so calling hfs.open
+    from worker threads fails on gs:// paths ("ClientSession must be created and used in same loop").
+    """
+    cols = ['Region', 'Group', 'Weight', 'max_MAF', p_field, 'BETA_Burden', 'SE_Burden', 'MAC', 'Number_rare']
+
+    def _read(path):
+        with hfs.open(path) as f:
+            d = pd.read_csv(f, sep='\t', dtype={'max_MAF': str, 'Weight': str, p_field: str})
+        d = d.loc[d.Group != 'Cauchy', [c for c in cols if c in d.columns]]
+        d['chunk'] = os.path.basename(path)
+        return d
+
+    d = pd.concat([_read(p) for p in paths], ignore_index=True)
+    if 'Weight' not in d.columns:
+        d['Weight'] = DEFAULT_SAIGE_WEIGHT
+    d['p'] = pd.to_numeric(d[p_field], errors='coerce')
+    d['_tier'] = pd.to_numeric(d.max_MAF, errors='coerce')
+    return d[d.p.notna() & d._tier.notna()].drop(columns=p_field)
+
+
+def dedup_tests(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -> pd.DataFrame:
+    """The per-test rows that enter the per-group CCTs (one copy of each gene, unique tiers).
+
+    1. Genes split across overlapping interval chunks: keep the chunk carrying the most alleles,
+       so a CCT never pools tests from two partial copies of a gene.
+    2. drop_duplicate_tiers (U3): within (gene, group, weight), a tier with the same MAC and
+       Number_rare as a lower tier is the same variant set (tiers are nested), so it enters once.
+    """
+    d = tests.copy()
+    best = (d.groupby(['Region', 'chunk']).MAC.max().reset_index()
+              .sort_values('MAC', ascending=False).drop_duplicates('Region'))
+    d = d.merge(best[['Region', 'chunk']], on=['Region', 'chunk'])
+    if drop_duplicate_tiers:
+        d = d.sort_values('_tier').drop_duplicates(['Region', 'Group', 'Weight', 'MAC', 'Number_rare'])
+    return d
+
+
+def group_cauchy_table(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -> pd.DataFrame:
+    """One row per (gene, group): CCT over weights x tiers, plus Beta_1_25-only and all-weights CCTs.
+
+    Pvalue_cct is the default test: all weights x tiers, except the groups in CCT_GROUP_WEIGHTS, which
+    use only their listed weights (pLoF: Beta_1_25). The same restriction applies to the ALL row.
+
+    Direction summaries over the same default test set (used by v8/discovery):
+      n_pos / n_neg           tests with BETA_Burden > 0 / < 0
+      n_pos_nom / n_neg_nom   the same among tests with p < SIGN_P (missense direction rule, decision O5)
+      Pvalue_cct_pos / _neg   CCT of the one-sided p in the + / - direction: p/2 if sign(BETA) agrees,
+                              else 1 - p/2 (directional pLoF p, picked downstream by the missense sign)
+      BETA_top, SE_top, max_MAF_top, Weight_top   the most significant test (description only)
+    Tests are deduplicated by dedup_tests() first. SAIGE emits no test below minGroupMAC_in_BurdenTest
+    (default 5), so genes whose group MAC is below it have no row for that group.
+    """
+    d = dedup_tests(tests, drop_duplicate_tiers)
+    d['_t'] = _cauchy_t(d.p.to_numpy())
+    sg = np.sign(d.BETA_Burden.to_numpy())
+    p = d.p.to_numpy()
+    nom = p < SIGN_P
+    d['_pos'], d['_neg'] = sg > 0, sg < 0
+    d['_pos_nom'], d['_neg_nom'] = (sg > 0) & nom, (sg < 0) & nom
+    d['_t_pos'] = _cauchy_t(np.where(sg > 0, p / 2, 1 - p / 2))
+    d['_t_neg'] = _cauchy_t(np.where(sg < 0, p / 2, 1 - p / 2))
+
+    default = np.ones(len(d), bool)
+    for grp, weights in CCT_GROUP_WEIGHTS.items():
+        default &= ~((d.Group == grp) & ~d.Weight.isin(weights)).to_numpy()
+    d['_default'] = default
+
+    def _summarise(x, keys):
+        xd = x[x._default]
+        g = xd.groupby(keys)
+        out = g.agg(cct_stat=('_t', 'mean'), n_tests=('_t', 'size'), n_tiers=('_tier', 'nunique'),
+                    n_weights=('Weight', 'nunique'), MAC=('MAC', 'max'), min_p=('p', 'min'),
+                    n_pos=('_pos', 'sum'), n_neg=('_neg', 'sum'),
+                    n_pos_nom=('_pos_nom', 'sum'), n_neg_nom=('_neg_nom', 'sum'),
+                    t_pos=('_t_pos', 'mean'), t_neg=('_t_neg', 'mean'))
+        out['Pvalue_cct'] = _cauchy_p(out.cct_stat)
+        out['Pvalue_cct_pos'] = _cauchy_p(out.t_pos)
+        out['Pvalue_cct_neg'] = _cauchy_p(out.t_neg)
+        for col, sub in [('Pvalue_cct_Beta_1_25', x[x.Weight == 'Beta_1_25']), ('Pvalue_cct_all_weights', x)]:
+            t = sub.groupby(keys)._t.mean()
+            out[col] = pd.Series(_cauchy_p(t), index=t.index)
+        top = xd.loc[g.p.idxmin()].set_index(keys)
+        for c in ['BETA_Burden', 'SE_Burden', 'max_MAF', 'Weight']:
+            out[f"{c.replace('_Burden', '')}_top"] = top[c]
+        return out.drop(columns=['cct_stat', 't_pos', 't_neg'])
+
+    per_group = _summarise(d, ['Region', 'Group']).reset_index()
+    all_groups = _summarise(d[~d.Group.isin(CCT_EXCLUDE_FROM_ALL)], ['Region']).reset_index()
+    all_groups.insert(1, 'Group', 'ALL')
+    res = pd.concat([per_group, all_groups], ignore_index=True)
+    parts = res.Region.str.split('_', n=1)
+    res.insert(0, 'gene_symbol', parts.str[1])
+    res.insert(0, 'gene_id', parts.str[0])
+    return res.drop(columns='Region').sort_values(['gene_id', 'Group']).reset_index(drop=True)
+
+
+def export_group_cauchy(directory: str, output_path: str, phenoname: str, trait_type: str = None,
+                        n_cases=None, n_controls=None, drop_duplicate_tiers: bool = True) -> pd.DataFrame:
+    """Write the per-group CCT table (with direction summaries) for one phenotype's SAIGE gene results.
+
+    trait_type ('binary' / 'continuous'), n_cases and n_controls are written as constant columns so the
+    discovery report can classify the phenotype without a separate manifest.
+    """
+    import gzip
+
+    paths = [m.path for m in hfs.ls(f'{directory}/*.gene.txt')]
+    if not paths:
+        raise ValueError(f"No *.gene.txt files found under {directory}")
+    res = group_cauchy_table(read_gene_txt_tests(paths), drop_duplicate_tiers)
+    res.insert(0, 'phenoname', phenoname)
+    for i, (col, val) in enumerate([('trait_type', trait_type), ('n_cases', n_cases), ('n_controls', n_controls)]):
+        res.insert(1 + i, col, val)
+    with hfs.open(output_path, 'wb') as f:
+        f.write(gzip.compress(res.to_csv(sep='\t', index=False, na_rep='NA').encode()))
+    print(f'Per-group Cauchy: {len(res)} gene x group rows -> {output_path}')
+    return res
+
+
+def group_cauchy_is_current(path: str) -> bool:
+    """True if the per-group CCT table exists and has the direction-summary columns."""
+    import gzip
+
+    if not hfs.exists(path):
+        return False
+    with hfs.open(path, 'rb') as f, gzip.open(f, 'rt') as g:
+        header = g.readline().rstrip('\n').split('\t')
+    return all(c in header for c in GROUP_CAUCHY_REQUIRED_COLS)
+
+
+def backfill_group_cauchy(directory: str, output_ht_directory: str, phenoname: str, trait_type: str):
+    """Write gene_results_cauchy_by_group.tsv.gz for a phenotype whose gene_results.ht already exists.
+
+    Case / control counts come from the existing HT's globals; the CCT itself only reads *.gene.txt.
+    """
+    hl.init(master='local[2]', tmp_dir=TMP_BUCKET, default_reference="GRCh38")
+    g = hl.eval(hl.read_table(f'{output_ht_directory}/gene_results.ht').globals)
+    export_group_cauchy(directory, f'{output_ht_directory}/{GROUP_CAUCHY_FILE}', phenoname, trait_type,
+                        n_cases=g.get('n_cases'), n_controls=g.get('n_controls'))
+
+
 def load_gene_data(directory: str,
                    output_ht_directory: str,
                    phenoname, 
@@ -454,7 +627,15 @@ def load_gene_data(directory: str,
                    quantitative_trait:bool,
                    null_glmm_log: str,
                    overwrite: bool = False,
-                   misc: bool = False):
+                   misc: bool = False,
+                   export_cauchy_by_group: bool = True,
+                   cauchy_phenoname: str = None):
+    """Import SAIGE *.gene.txt into gene_results.ht (+ expected-p HT).
+
+    export_cauchy_by_group: also write gene_results_cauchy_by_group.tsv.gz (per-group CCTs and
+    direction summaries; input of v8/discovery). cauchy_phenoname: phenotype label written in that
+    table (defaults to phenoname; pass the sex-tagged name for sex-specific runs).
+    """
 
     hl.init(
         master='local[8]',
@@ -556,6 +737,14 @@ def load_gene_data(directory: str,
     ht = ht.annotate_globals(n_cases=n_cases, n_controls=n_controls, N=N)
     ht.describe()
     ht = ht.checkpoint(output_ht_path, overwrite=overwrite, _read_if_exists=not overwrite)
+
+    # one CCT per group (and ALL non-synonymous groups) over weights x tiers; SAIGE's own Cauchy row
+    # pools every group and stays in gene_results.ht unchanged
+    if export_cauchy_by_group:
+        export_group_cauchy(directory, f'{output_ht_directory}/{GROUP_CAUCHY_FILE}',
+                            cauchy_phenoname or phenoname,
+                            trait_type='continuous' if quantitative_trait else 'binary',
+                            n_cases=n_cases, n_controls=n_controls)
 
     if not phenoname.endswith('male') or phenoname.startswith('EM_202.2') or phenoname.startswith('EM_236.1') or phenoname.startswith('A10BJ'):
         method = 'exact'
@@ -2233,7 +2422,25 @@ def main(args):
                     quantitative_trait = phenoname in quantitative_traits
    
                     if not args.skip_load_gene_results and analysis_type == 'gene':
-                        if (not hfs.exists(f'{output_ht_directory}/gene_results_exact_expected_p.ht/_SUCCESS')) or args.overwrite_hail_results:
+                        ht_done = hfs.exists(f'{output_ht_directory}/gene_results_exact_expected_p.ht/_SUCCESS')
+                        cct_done = args.skip_group_cauchy or group_cauchy_is_current(
+                            f'{output_ht_directory}/{GROUP_CAUCHY_FILE}')
+                        if ht_done and not cct_done and not args.overwrite_hail_results:
+                            # gene_results.ht exists from an earlier run: only add the per-group CCT table
+                            print(f'[{ancestry.upper()}: {phenoname}{sex_tag}] Per-group Cauchy table (backfill)')
+                            j = b.new_python_job(
+                                name=f'group_cauchy_{phenoname}{sex_tag}_{ancestry}',
+                                attributes={"analysis_type": analysis_type, "ancestry": ancestry,
+                                            "phenotype": copy.deepcopy(phenoname), "pheno_sex": copy.deepcopy(sex_to_run)})
+                            j.image("hailgenetics/hail:0.2.133-py3.11")
+                            j.memory('standard')
+                            j.cpu(4)
+                            j.call(backfill_group_cauchy,
+                                   directory=directory,
+                                   output_ht_directory=output_ht_directory,
+                                   phenoname=f'{phenoname}{sex_tag}',
+                                   trait_type='continuous' if quantitative_trait else 'binary')
+                        elif (not ht_done) or args.overwrite_hail_results:
                             print(f'[{ancestry.upper()}: {phenoname}{sex_tag}] Gene table')
                             j = b.new_python_job(
                                 name=f'sync_saige_{analysis_type}_gene_HT_{phenoname}{sex_tag}_{ancestry}',
@@ -2248,11 +2455,14 @@ def main(args):
                                    directory=directory,
                                    output_ht_directory=output_ht_directory,
                                    phenoname=phenoname,
+                                   ancestry=ancestry,
                                    gene_ht_map_path=gene_ht_map_path,
                                    quantitative_trait=quantitative_trait,
                                    null_glmm_log=null_glmm_log,
                                    overwrite=True,
-                                   misc=args.misc_test
+                                   misc=args.misc_test,
+                                   export_cauchy_by_group=not args.skip_group_cauchy,
+                                   cauchy_phenoname=f'{phenoname}{sex_tag}',
                                    )
                             if phenoname in list(saige_tasks.keys()) and not args.skip_saige:
                                 j.depends_on(*saige_tasks[f'{phenoname}{sex_tag}'])
@@ -2683,6 +2893,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--skip-load-gene-results", help="Skip loading gene level test results", action="store_true"
+    )
+    parser.add_argument(
+        "--skip-group-cauchy",
+        help="Do not write gene_results_cauchy_by_group.tsv.gz (per-group CCTs used by v8/discovery). "
+             "By default it is written with the gene HT, and backfilled for phenotypes whose HT already exists",
+        action="store_true",
     )
     parser.add_argument(
         "--test",
