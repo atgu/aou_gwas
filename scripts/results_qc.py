@@ -482,7 +482,7 @@ def main(args):
 
         if not hl.hadoop_exists('gs://aou_wlu/250k_qc/phenotype_info.ht') or args.overwrite:
             backend = hb.ServiceBackend(
-                billing_project="all-by-aou", remote_tmpdir='gs://aou_tmp/'
+                billing_project="all-by-aou-fy27", remote_tmpdir='gs://aou_tmp/'
             )
 
             b = hb.Batch(

@@ -481,7 +481,7 @@ if __name__ == "__main__":
         "--billing-project",
         help="Name of the billing project",
         nargs="?",
-        default='all-by-aou'
+        default='all-by-aou-fy27'
     )
     parser.add_argument(
         "--tmp-bucket",

@@ -318,7 +318,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--billing-project",
         help="Name of the billing project",
-        default="all-by-aou"
+        default="all-by-aou-fy27"
     )
     parser.add_argument(
         "--tmp-bucket",

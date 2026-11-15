@@ -1,7 +1,7 @@
 import hailtop.batch as hb
 
 
-with hb.ServiceBackend('all-by-aou') as backend:
+with hb.ServiceBackend('all-by-aou-fy27') as backend:
     # FIXME: switch 95 to 105    
     # https://ftp.ensembl.org/pub/release-105/variation/indexed_vep_cache/homo_sapiens_vep_105_GRCh38.tar.gz
     root = 'homo_sapiens_vep_105_GRCh38'

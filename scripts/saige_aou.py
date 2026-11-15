@@ -904,7 +904,7 @@ def main(args):
         phenos_to_run_by_pop_by_group = None
 
     backend = hb.ServiceBackend(
-        billing_project="all-by-aou", remote_tmpdir=TMP_BUCKET
+        billing_project="all-by-aou-fy27", remote_tmpdir=TMP_BUCKET
     )
 
     if args.export_phenos:

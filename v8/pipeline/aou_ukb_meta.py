@@ -945,8 +945,8 @@ if __name__ == '__main__':
                         help='CSV with phenoname and ukb_phenocode columns for phenotype mapping')
     parser.add_argument('--batch', action='store_true',
                         help='Submit jobs via Hail Batch instead of running locally')
-    parser.add_argument('--billing-project', default='all-by-aou',
-                        help='Hail Batch billing project (default: all-by-aou)')
+    parser.add_argument('--billing-project', default='all-by-aou-fy27',
+                        help='Hail Batch billing project (default: all-by-aou-fy27)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing results')
     parser.add_argument('--qc-results', action='store_true',

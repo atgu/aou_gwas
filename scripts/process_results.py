@@ -357,7 +357,7 @@ def main(args):
 
 
         backend = hb.ServiceBackend(
-            billing_project="all-by-aou",
+            billing_project="all-by-aou-fy27",
             remote_tmpdir='gs://aou_tmp/'
         )
 
@@ -524,7 +524,7 @@ def main(args):
 
 
         backend = hb.ServiceBackend(
-            billing_project="all-by-aou", remote_tmpdir='gs://aou_tmp/'
+            billing_project="all-by-aou-fy27", remote_tmpdir='gs://aou_tmp/'
         )
 
         b = hb.Batch(

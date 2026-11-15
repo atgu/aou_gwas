@@ -165,7 +165,7 @@ def main(args):
         #                                                 requirements=['hail'], python_version='3.9')
 
         backend = hb.ServiceBackend(
-            billing_project="all-by-aou",
+            billing_project="all-by-aou-fy27",
             remote_tmpdir=f"{root}/tmp",
         )
         b = hb.Batch(
@@ -255,5 +255,5 @@ if __name__ == "__main__":
     main(args)
 
 # python3 export_vds_to_bgen.py --test --mean_impute_missing --update-vds
-# hailctl config set batch/billing_project all-by-aou
+# hailctl config set batch/billing_project all-by-aou-fy27
 # hailctl config set batch/remote_tmpdir gs://aou_wlu/tmp

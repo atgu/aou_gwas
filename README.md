@@ -120,7 +120,7 @@ chromosome-fragment scale.
 ### Hail Query-on-Batch configuration
 Before running any QoB job, configure `hailctl`:
 ```
-hailctl config set batch/billing_project all-by-aou
+hailctl config set batch/billing_project all-by-aou-fy27
 hailctl config set batch/remote_tmpdir gs://aou_tmp
 hailctl config set query/backend batch
 hailctl config list

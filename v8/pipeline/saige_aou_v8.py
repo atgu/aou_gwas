@@ -1784,7 +1784,7 @@ def main(args):
 
     if not args.dataproc:
         backend = hb.ServiceBackend(
-            billing_project="all-by-aou", remote_tmpdir=TMP_BUCKET
+            billing_project="all-by-aou-fy27", remote_tmpdir=TMP_BUCKET
         )
 
     if args.export_phenos:
@@ -2727,7 +2727,7 @@ def main(args):
 
         if not args.dataproc:
             backend = hb.ServiceBackend(
-                billing_project="all-by-aou",
+                billing_project="all-by-aou-fy27",
                 remote_tmpdir='gs://aou_tmp/v8'
             )
 
@@ -2789,7 +2789,7 @@ def main(args):
                         j.memory('100G')
                     j.spot(True)
                     j.env('HAIL_QUERY_BACKEND', 'batch')    
-                    j.env('HAIL_BATCH_BILLING_PROJECT', 'all-by-aou')
+                    j.env('HAIL_BATCH_BILLING_PROJECT', 'all-by-aou-fy27')
                     j.env('HAIL_BATCH_REMOTE_TMPDIR', 'gs://aou_tmp/v8')
                     j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 100g --executor-memory 100g pyspark-shell')
                     j.call(run_meta_analysis_ht,
@@ -2812,7 +2812,7 @@ def main(args):
                     j2.image("hailgenetics/hail:0.2.133-py3.11")
                     j2.storage("20G")
                     j2.env('HAIL_QUERY_BACKEND', 'batch')    
-                    j2.env('HAIL_BATCH_BILLING_PROJECT', 'all-by-aou')
+                    j2.env('HAIL_BATCH_BILLING_PROJECT', 'all-by-aou-fy27')
                     j2.env('HAIL_BATCH_REMOTE_TMPDIR', 'gs://aou_tmp/v8')
                     j2.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 100g --executor-memory 100g pyspark-shell')
                     if j is not None:

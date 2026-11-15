@@ -1197,7 +1197,7 @@ def main(args):
     try:
         if args.batch:
             backend = hb.ServiceBackend(
-                billing_project="all-by-aou",
+                billing_project="all-by-aou-fy27",
                 remote_tmpdir=TMP_BUCKET,
             )
             b = hb.Batch(

@@ -47,7 +47,7 @@ if __name__ == "__main__":
         "--billing-project",
         help="Name of the billing project",
         nargs="?",
-        default="all-by-aou"
+        default="all-by-aou-fy27"
     )
     parser.add_argument(
         "--tmp-bucket",
@@ -112,5 +112,5 @@ if __name__ == "__main__":
 # hailctl auth login
 # hailctl config set batch/tmp_dir gs://aou_wlu/tmp
 # hailctl config set batch/remote_tmpdir gs://aou_wlu/tmp
-# hailctl config set batch/billing_project all-by-aou
+# hailctl config set batch/billing_project all-by-aou-fy27
 # hailctl config set query/backend batch (or spark)
