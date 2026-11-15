@@ -156,6 +156,65 @@ Options: `-q TRUE` skips Manhattan plots; `-h` lists all options.
 python3 scripts/saige_aou.py --run_pipeline --phenos height,p_0.5_continuous_1 --pops eur --irnt --single_variant_only --skip_saige --skip_bgen --test
 ```
 
+#### [v8/pipeline/saige_aou_v8.py](v8/pipeline/saige_aou_v8.py): weighted burden with FlexRV (saige-slim)
+Gene-based tests where missense variants are weighted by a pathogenicity score
+(`--saige-gene-weight`, e.g. `AM_pct`). `--saige-gene-mode` takes three values:
+
+| Mode | Group file | Step 2 |
+|---|---|---|
+| `unguided` | `var` / `anno` | Beta(1,25) burden, SAIGE 1.5.1 (`wzhou88/saige`) |
+| `weighted` | plus one `weight` line | one weighted burden, SAIGE 1.5.1 (`wzhou88/saige`) |
+| `flexRV_native` | plus one `score,<WEIGHT>` line (missense + pLoF) | FlexRV, saige-slim |
+
+**Why FlexRV through saige-slim.** FlexRV tests each gene under a grid of
+score × MAF weightings and combines them with a Cauchy test, so no single
+weighting has to be chosen in advance. saige-slim builds that grid itself from
+the one score line, using the in-sample MAF/MAC, and sends sparse weighted sets
+to an exact test. That removes the false positives our own FlexRV group files
+produced on rare binary traits, without an allele-count filter. On the EUR
+pilot (5 real and 5 null phenotypes) it gave 0 exome-wide hits on the nulls
+(our route unfiltered: 83, 1 and 3 on three of them) and the same hits on the
+real traits as our filtered route.
+
+`flexRV_native` specifics: max MAF is fixed at 0.001; step 2 reads the
+per-interval PGENs; binary and quantitative traits only (no sex-specific or
+time-to-event runs); each `--groups` entry is one saige-slim call (FlexRV if it
+contains a missense annotation, Beta(1,25) burden for `pLoF`), merged into one
+`.gene.txt` per interval with a `Run_group` column.
+
+```
+# group files (once per ancestry / score), step 2 and loading; the three groups feed the discovery report
+python3 v8/pipeline/saige_aou_v8.py --run-pipeline --ancestries eur \
+    --phenos height,EM_202.2,random_0.5_0.01_1 \
+    --saige-gene-map-source gnomad_context \
+    --saige-gene-mode flexRV_native --saige-gene-weight AM_pct \
+    --groups "pLoF:missenseLC,missenseLC,pLoF"
+```
+Add `--test` to run one interval (TTN region, EUR) first. Existing null models
+and interval results are reused, so rerunning the same command resubmits only
+the intervals whose step-2 job failed. `--skip-bgen --skip-saige
+--skip-any-null-models` only loads.
+
+Outputs, under `gs://aou_amc_analyses/results/`:
+- `gene_results/result/<map>/flexRV_native/<WEIGHT>/<ANC>/phenotype_<X>/`: per-interval `.gene.txt` (one row per weight set, plus saige-slim's `Cauchy` row) and single-variant results
+- `ht_results/<map>/flexRV_native/<WEIGHT>/<ANC>/phenotype_<X>/gene_results.ht` and `gene_results_cauchy_by_group.tsv.gz` (one row per gene × group; `Pvalue_cct` is saige-slim's FlexRV p for the missense groups and the burden p for pLoF)
+- in the same folder, `gene_results_exact_expected_p.ht` and one `gene_results_exact_expected_p_Cauchy_<group>.txt.bgz` per `--groups` entry: observed vs expected p of the gene-level Cauchy rows, with the genomic-control lambdas in the table globals (`lambda_gc_maxmaf_Cauchy_<group>`)
+
+#### [utils/discovery.py](utils/discovery.py): discovery report
+Reads the per-group tables above and reports, per gene × trait, (1) discovery
+under the combined `pLoF;missenseLC` test and (2) whether pLoF in the same gene
+acts in the direction of the missense signal ("LoF-like"). Null phenotypes
+(`random_*`) in the same run give the calibration and matched-FPR thresholds,
+so include them in `--phenos`. The method is described in the module docstring.
+```
+# --production-root (optional): ht_results root of the unweighted run, for novelty labels
+python utils/discovery.py \
+    --weighted-root gs://aou_amc_analyses/results/ht_results/gnomad_context/flexRV_native/AM_PCT/EUR \
+    --out discovery_EUR
+```
+Writes `report_log.txt` (every number of the report), `h_hits_weighted.tsv`
+(one row per hit) and `figures/` to `--out`.
+
 #### [scripts/reformat_vat.py](scripts/reformat_vat.py)
 Load the original `.tsv.gz` VAT, parse non-string fields, sort, and key by
 `locus`/`alleles`.

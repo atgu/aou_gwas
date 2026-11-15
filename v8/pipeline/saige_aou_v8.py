@@ -56,25 +56,60 @@ ACAF_MT_PATH = ''
 EXOME_MT_PATH = ''
 
 
-SAIGE_DOCKER_IMAGE = "us-central1-docker.pkg.dev/aou-neale-gwas/saige/saige.multiweights:saige_multiweights"
-LEGACY_SAIGE_MODE = "legacy_saige_no_weights"
-SAIGE_DOCKER_IMAGE_BY_MODE = {
-    LEGACY_SAIGE_MODE: "wzhou88/saige:1.5.1"
-}
+SAIGE_DOCKER_IMAGE = "wzhou88/saige:1.5.1"
+SAIGE_SLIM_DOCKER_IMAGE = "us-central1-docker.pkg.dev/aou-neale-gwas/saige/saige-slim:1.5.2-dev-c09b7890"
 
-GROUP_FILE_MODE_ALIASES = {LEGACY_SAIGE_MODE: "unguided"}
-
+# unguided: no weights. weighted: one `weight` line. flexRV_native: saige-slim's built-in FlexRV
+# on one `score` line (step 2 on the saige-slim image). Weight / score: --saige-gene-weight.
+SAIGE_GENE_MODES = ("unguided", "weighted", "flexRV_native")
 GENE_MAP_SOURCES = {'brava', 'gnomad_context'}
+MISSENSE_ANNOTATIONS = {'missenseother_missense', 'missenseLC'}
 
 
-def resolve_saige_docker_image(mode: str) -> str:
-    """SAIGE image for a --saige-gene-mode, defaulting to the multiweight build."""
-    return SAIGE_DOCKER_IMAGE_BY_MODE.get(mode, SAIGE_DOCKER_IMAGE)
+def flexrv_native_calls(groups: str) -> list:
+    """saige-slim calls for a flexRV_native --groups value: [(entry, use_flexrv)].
+
+    An entry with a missense annotation is tested with FlexRV, pLoF alone with Beta(1,25).
+    FlexRV entries come first, widest first: the merged file takes the first call's columns.
+    """
+    entries = [g.strip() for g in groups.split(',') if g.strip()]
+    if len(set(entries)) != len(entries):
+        raise ValueError(f"--groups lists a group twice: {groups!r}")
+    calls = []
+    for entry in entries:
+        annos = set(entry.split(':'))
+        if not annos <= MISSENSE_ANNOTATIONS | {'pLoF'}:
+            raise ValueError(f"--groups entry {entry!r}: flexRV_native group files hold missense and pLoF "
+                             "variants only; use --saige-gene-mode unguided for other annotations")
+        calls.append((entry, bool(annos & MISSENSE_ANNOTATIONS)))
+    if not any(use_flexrv for _, use_flexrv in calls):
+        raise ValueError(f"flexRV_native needs a --groups entry with a missense annotation, got {groups!r}")
+    return sorted(calls, key=lambda c: (not c[1], -len(c[0].split(':'))))
 
 
-def resolve_group_file_mode(mode: str) -> str:
-    """Mode whose directory holds the group files this mode should read."""
-    return GROUP_FILE_MODE_ALIASES.get(mode, mode)
+def check_result_groups(pheno_results_dir: str, calls: list, paths=None) -> None:
+    """Stop if the existing .gene.txt files were made with another --groups (existing intervals are reused)."""
+    if paths is None:
+        paths = [x["path"] for x in hl.hadoop_ls(pheno_results_dir)]
+    expected = {e.replace(':', ';') for e, _ in calls}
+    found, n_checked = set(), 0
+    for path in sorted(x for x in paths if x.endswith('.gene.txt')):
+        with hfs.open(path) as f:
+            rows = [line.rstrip('\n').split('\t') for line in f if line.strip()]
+        if len(rows) < 2:
+            continue
+        if 'Run_group' in rows[0]:
+            k = rows[0].index('Run_group')
+            found |= {r[k] for r in rows[1:] if len(r) > k}
+        else:
+            found.add('(no Run_group column)')
+        n_checked += 1
+        if n_checked == 5:      # a few intervals: a small one may lack rows for some group
+            break
+    if n_checked and found != expected:
+        raise ValueError(
+            f"{pheno_results_dir} was made with --groups {sorted(found)}, not {sorted(expected)}. "
+            "Use the original --groups, or --overwrite-results to rerun this phenotype")
 
 
 THRESHOLD_MODE_DIR = "threshold"
@@ -374,7 +409,13 @@ def annotate_expected_pvalue(
 
     return ht
 
-def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:str, method:str, overwrite:bool, misc:bool=False):
+def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:str, method:str, overwrite:bool, misc:bool=False,
+                         path: str = None):
+    """Expected p-values and lambda GC for a results table (`path`; default: the ht_results/<ANC>/ layout).
+
+    Gene tables: one stratum per max MAF tier plus the Cauchy rows. flexRV_native tables use the
+    Cauchy rows only, one stratum per --groups entry (the per-weight-set rows are correlated tests).
+    """
     # if ancestry == 'meta':
         # hl.init(backend='batch', app_name=f'expected_p_{pheno}_{ancestry}_{method}_{table_name}_QoBiB')
     if '_to_' in pheno:
@@ -384,7 +425,8 @@ def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:
     sex_tag = ''
     if pheno.endswith('male') or pheno.endswith('female'):
         sex_tag = f"_{pheno.split('_')[-1]}"
-    path = f'{ANALYSIS_BUCKET}/{software_type}ht_results{sex_tag}{"" if not misc else "_misc"}/{ancestry.upper()}/phenotype_{pheno}/{table_name}.ht'
+    if path is None:
+        path = f'{ANALYSIS_BUCKET}/{software_type}ht_results{sex_tag}{"" if not misc else "_misc"}/{ancestry.upper()}/phenotype_{pheno}/{table_name}.ht'
     success = path.replace('.ht', f'_{method}_expected_p.ht/_SUCCESS')
     if (hl.hadoop_exists(path) and not hl.hadoop_exists(success)) or overwrite:
         overwrite=True
@@ -409,9 +451,19 @@ def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:
             p_value_fields = [f for f in ht.row_value if f.startswith('Pvalue') and not f.endswith('_log10')]
             if not p_value_fields:
                 raise ValueError(f"No Pvalue* column found in {path}")
-            for max_MAF in [0.01, 0.001, 0.0001, -1]:
-                tag = 'Cauchy' if max_MAF == -1 else str(max_MAF)
-                sub_ht = ht.filter(ht.max_MAF == max_MAF)
+            tiers = sorted(ht.aggregate(hl.agg.collect_as_set(ht.max_MAF)), reverse=True)
+            tiers = [t for t in tiers if t != -1] + ([-1] if -1 in tiers else [])
+            if 'Run_group' in ht.row:
+                run_groups = sorted(ht.aggregate(hl.agg.filter(ht.max_MAF == -1, hl.agg.collect_as_set(ht.Run_group))))
+                strata = [(f"Cauchy_{g.replace(':', '_').replace(';', '_')}", (ht.max_MAF == -1) & (ht.Run_group == g))
+                          for g in run_groups]
+            else:
+                strata = [('Cauchy' if t == -1 else str(t), ht.max_MAF == t) for t in tiers]
+            if not strata:
+                raise ValueError(f"No rows to compute expected p-values on in {path}")
+            print(f"Expected-p strata: {[tag for tag, _ in strata]}")
+            for tag, keep in strata:
+                sub_ht = ht.filter(keep)
                 for p_field in p_value_fields:
                     sub_ht = annotate_expected_pvalue(ht=sub_ht, method=method, p_field=p_field)
                 sub_ht.describe()
@@ -421,9 +473,9 @@ def create_expected_p_ht(pheno:str, ancestry:str, table_name:str, analysis_type:
                 sub_ht = sub_ht.checkpoint(path.replace('.ht', f'_{method}_expected_p_{tag}.ht'), overwrite=overwrite,
                                     _read_if_exists=not overwrite)
                 sub_ht.export(path.replace('.ht', f'_{method}_expected_p_{tag}.txt.bgz'))
-            ht = hl.read_table(path.replace('.ht', f'_{method}_expected_p_0.01.ht'))
-            for max_MAF in [0.001, 0.0001, -1]:
-                tag = 'Cauchy' if max_MAF == -1 else str(max_MAF)
+            tags = [tag for tag, _ in strata]
+            ht = hl.read_table(path.replace('.ht', f'_{method}_expected_p_{tags[0]}.ht'))
+            for tag in tags[1:]:
                 tmp_ht = hl.read_table(path.replace('.ht', f'_{method}_expected_p_{tag}.ht'))
                 ht = ht.union(tmp_ht)
                 ht = ht.annotate_globals(
@@ -455,9 +507,7 @@ def discover_pvalue_fields(directory: str) -> list:
 # --------------------------------------------------------------------------------------------------
 GROUP_CAUCHY_FILE = 'gene_results_cauchy_by_group.tsv.gz'
 CCT_EXCLUDE_FROM_ALL = ('synonymous',)
-CCT_GROUP_WEIGHTS = {'pLoF': ('Beta_1_25',)}
-# Weight label given to rows of a SAIGE build that writes no Weight column (legacy, unweighted runs
-# use the default Beta(1,25) weights)
+# Weight label of Beta(1,25) tests (SAIGE writes no Weight column for them)
 DEFAULT_SAIGE_WEIGHT = 'Beta_1_25'
 SIGN_P = 0.05
 GROUP_CAUCHY_REQUIRED_COLS = ('Pvalue_cct_pos', 'Pvalue_cct_neg', 'n_pos_nom', 'n_neg_nom')
@@ -516,63 +566,101 @@ def dedup_tests(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -> pd.Da
     return d
 
 
-def group_cauchy_table(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -> pd.DataFrame:
-    """One row per (gene, group): CCT over weights x tiers, plus Beta_1_25-only and all-weights CCTs.
-
-    Pvalue_cct is the default test: all weights x tiers, except the groups in CCT_GROUP_WEIGHTS, which
-    use only their listed weights (pLoF: Beta_1_25). The same restriction applies to the ALL row.
-
-    Direction summaries over the same default test set (used by v8/discovery):
-      n_pos / n_neg           tests with BETA_Burden > 0 / < 0
-      n_pos_nom / n_neg_nom   the same among tests with p < SIGN_P (missense direction rule, decision O5)
-      Pvalue_cct_pos / _neg   CCT of the one-sided p in the + / - direction: p/2 if sign(BETA) agrees,
-                              else 1 - p/2 (directional pLoF p, picked downstream by the missense sign)
-      BETA_top, SE_top, max_MAF_top, Weight_top   the most significant test (description only)
-    Tests are deduplicated by dedup_tests() first. SAIGE emits no test below minGroupMAC_in_BurdenTest
-    (default 5), so genes whose group MAC is below it have no row for that group.
-    """
-    d = dedup_tests(tests, drop_duplicate_tiers)
-    d['_t'] = _cauchy_t(d.p.to_numpy())
-    sg = np.sign(d.BETA_Burden.to_numpy())
+def _add_test_columns(d: pd.DataFrame) -> pd.DataFrame:
+    """Cauchy statistic and direction flags of each test; one-sided p = p/2 if sign(BETA) agrees, else 1 - p/2."""
     p = d.p.to_numpy()
+    sg = np.sign(d.BETA_Burden.to_numpy())
     nom = p < SIGN_P
+    d['_t'] = _cauchy_t(p)
     d['_pos'], d['_neg'] = sg > 0, sg < 0
     d['_pos_nom'], d['_neg_nom'] = (sg > 0) & nom, (sg < 0) & nom
     d['_t_pos'] = _cauchy_t(np.where(sg > 0, p / 2, 1 - p / 2))
     d['_t_neg'] = _cauchy_t(np.where(sg < 0, p / 2, 1 - p / 2))
+    return d
 
-    default = np.ones(len(d), bool)
-    for grp, weights in CCT_GROUP_WEIGHTS.items():
-        default &= ~((d.Group == grp) & ~d.Weight.isin(weights)).to_numpy()
-    d['_default'] = default
 
-    def _summarise(x, keys):
-        xd = x[x._default]
-        g = xd.groupby(keys)
-        out = g.agg(cct_stat=('_t', 'mean'), n_tests=('_t', 'size'), n_tiers=('_tier', 'nunique'),
-                    n_weights=('Weight', 'nunique'), MAC=('MAC', 'max'), min_p=('p', 'min'),
-                    n_pos=('_pos', 'sum'), n_neg=('_neg', 'sum'),
-                    n_pos_nom=('_pos_nom', 'sum'), n_neg_nom=('_neg_nom', 'sum'),
-                    t_pos=('_t_pos', 'mean'), t_neg=('_t_neg', 'mean'))
-        out['Pvalue_cct'] = _cauchy_p(out.cct_stat)
-        out['Pvalue_cct_pos'] = _cauchy_p(out.t_pos)
-        out['Pvalue_cct_neg'] = _cauchy_p(out.t_neg)
-        for col, sub in [('Pvalue_cct_Beta_1_25', x[x.Weight == 'Beta_1_25']), ('Pvalue_cct_all_weights', x)]:
-            t = sub.groupby(keys)._t.mean()
-            out[col] = pd.Series(_cauchy_p(t), index=t.index)
-        top = xd.loc[g.p.idxmin()].set_index(keys)
-        for c in ['BETA_Burden', 'SE_Burden', 'max_MAF', 'Weight']:
-            out[f"{c.replace('_Burden', '')}_top"] = top[c]
-        return out.drop(columns=['cct_stat', 't_pos', 't_neg'])
+def _summarise_tests(d: pd.DataFrame, keys: list) -> pd.DataFrame:
+    """CCT, direction summaries and most significant test (*_top) per `keys`."""
+    g = d.groupby(keys)
+    out = g.agg(cct_stat=('_t', 'mean'), n_tests=('_t', 'size'), n_tiers=('_tier', 'nunique'),
+                n_weights=('Weight', 'nunique'), MAC=('MAC', 'max'), min_p=('p', 'min'),
+                n_pos=('_pos', 'sum'), n_neg=('_neg', 'sum'),
+                n_pos_nom=('_pos_nom', 'sum'), n_neg_nom=('_neg_nom', 'sum'),
+                t_pos=('_t_pos', 'mean'), t_neg=('_t_neg', 'mean'))
+    out['Pvalue_cct'] = _cauchy_p(out.cct_stat)
+    out['Pvalue_cct_pos'] = _cauchy_p(out.t_pos)
+    out['Pvalue_cct_neg'] = _cauchy_p(out.t_neg)
+    top = d.loc[g.p.idxmin()].set_index(keys)
+    for c in ['BETA_Burden', 'SE_Burden', 'max_MAF', 'Weight']:
+        out[f"{c.replace('_Burden', '')}_top"] = top[c]
+    return out.drop(columns=['cct_stat', 't_pos', 't_neg'])
 
-    per_group = _summarise(d, ['Region', 'Group']).reset_index()
-    all_groups = _summarise(d[~d.Group.isin(CCT_EXCLUDE_FROM_ALL)], ['Region']).reset_index()
-    all_groups.insert(1, 'Group', 'ALL')
-    res = pd.concat([per_group, all_groups], ignore_index=True)
+
+def _split_region(res: pd.DataFrame) -> pd.DataFrame:
+    """Region (<gene_id>_<symbol>) -> gene_id, gene_symbol (NA when the gene has no symbol)."""
     parts = res.Region.str.split('_', n=1)
-    res.insert(0, 'gene_symbol', parts.str[1])
+    res.insert(0, 'gene_symbol', parts.str[1].where(~parts.str[1].isin(['', '_'])))
     res.insert(0, 'gene_id', parts.str[0])
     return res.drop(columns='Region').sort_values(['gene_id', 'Group']).reset_index(drop=True)
+
+
+def group_cauchy_table(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -> pd.DataFrame:
+    """One row per (gene, group), plus ALL (non-synonymous groups): Pvalue_cct is the CCT over the max MAF tiers.
+
+    Direction summaries (used by utils/discovery.py): n_pos / n_neg, the same among tests with
+    p < SIGN_P (*_nom), and Pvalue_cct_pos / _neg, the CCT of the one-sided p in each direction.
+    """
+    d = _add_test_columns(dedup_tests(tests, drop_duplicate_tiers))
+    per_group = _summarise_tests(d, ['Region', 'Group']).reset_index()
+    all_groups = _summarise_tests(d[~d.Group.isin(CCT_EXCLUDE_FROM_ALL)], ['Region']).reset_index()
+    all_groups.insert(1, 'Group', 'ALL')
+    return _split_region(pd.concat([per_group, all_groups], ignore_index=True))
+
+
+def read_flexrv_native_gene_txt(paths, p_field: str = 'Pvalue_Burden') -> pd.DataFrame:
+    """All rows (per weight set and Cauchy) of flexRV_native *.gene.txt files, tagged with their chunk."""
+    cols = ['Region', 'Group', 'Run_group', 'Weight', 'max_MAF', p_field, 'BETA_Burden', 'SE_Burden',
+            'MAC', 'Number_rare']
+
+    def _read(path):
+        with hfs.open(path) as f:
+            d = pd.read_csv(f, sep='\t', dtype={'max_MAF': str, 'Weight': str, p_field: str}, na_values=['NA'])
+        d = d[[c for c in cols if c in d.columns]]
+        d['chunk'] = os.path.basename(path)
+        return d
+
+    d = pd.concat([_read(p) for p in paths], ignore_index=True)
+    d['p'] = pd.to_numeric(d[p_field], errors='coerce')
+    return d[d.p.notna()].drop(columns=p_field)
+
+
+def flexrv_native_group_cauchy_table(rows: pd.DataFrame) -> pd.DataFrame:
+    """One row per (gene, --groups entry) from read_flexrv_native_gene_txt() rows.
+
+    Pvalue_cct is saige-slim's own Cauchy row for FlexRV groups and the burden p for Beta(1,25)
+    groups (pLoF, a single test); Pvalue_cct_recomputed is the equal-weight CCT over the weight sets.
+    """
+    is_cauchy = (rows.Group == 'Cauchy').to_numpy()
+    d = rows[~is_cauchy].copy()
+    # a gene split across overlapping intervals: keep the chunk carrying the most alleles
+    best = (d.groupby(['Region', 'chunk']).MAC.max().reset_index()
+              .sort_values('MAC', ascending=False).drop_duplicates('Region'))[['Region', 'chunk']]
+    d = d.merge(best, on=['Region', 'chunk'])
+    slim = (rows[is_cauchy].merge(best, on=['Region', 'chunk'])
+            .drop_duplicates(['Region', 'Run_group']).set_index(['Region', 'Run_group']).p)
+
+    d['Group'] = d.Run_group
+    d['_tier'] = pd.to_numeric(d.max_MAF, errors='coerce')
+    out = _summarise_tests(_add_test_columns(d), ['Region', 'Group'])
+    recomputed = out.Pvalue_cct.to_numpy()
+    slim_p = slim.reindex(out.index).to_numpy()
+    is_beta = out.index.get_level_values('Group').map(
+        (d.Weight == DEFAULT_SAIGE_WEIGHT).groupby(d.Group).all()).to_numpy(dtype=bool)
+    i = out.columns.get_loc('Pvalue_cct')
+    out.insert(i, 'Pvalue_cct_slim', slim_p)
+    out.insert(i, 'Pvalue_cct_recomputed', recomputed)
+    out['Pvalue_cct'] = np.where(is_beta | np.isnan(slim_p), recomputed, slim_p)
+    return _split_region(out.reset_index())
 
 
 def export_group_cauchy(directory: str, output_path: str, phenoname: str, trait_type: str = None,
@@ -587,8 +675,15 @@ def export_group_cauchy(directory: str, output_path: str, phenoname: str, trait_
     paths = [m.path for m in hfs.ls(f'{directory}/*.gene.txt')]
     if not paths:
         raise ValueError(f"No *.gene.txt files found under {directory}")
-    res = group_cauchy_table(read_gene_txt_tests(paths), drop_duplicate_tiers)
+    with hfs.open(paths[0]) as f:
+        flexrv_native = 'Run_group' in f.readline().rstrip('\n').split('\t')
+    if flexrv_native:
+        res = flexrv_native_group_cauchy_table(read_flexrv_native_gene_txt(paths))
+    else:
+        res = group_cauchy_table(read_gene_txt_tests(paths), drop_duplicate_tiers)
     res.insert(0, 'phenoname', phenoname)
+    if trait_type == 'continuous':
+        n_controls = None
     for i, (col, val) in enumerate([('trait_type', trait_type), ('n_cases', n_cases), ('n_controls', n_controls)]):
         res.insert(1 + i, col, val)
     with hfs.open(output_path, 'wb') as f:
@@ -629,12 +724,15 @@ def load_gene_data(directory: str,
                    overwrite: bool = False,
                    misc: bool = False,
                    export_cauchy_by_group: bool = True,
-                   cauchy_phenoname: str = None):
+                   cauchy_phenoname: str = None,
+                   flexrv_native: bool = False):
     """Import SAIGE *.gene.txt into gene_results.ht (+ expected-p HT).
 
     export_cauchy_by_group: also write gene_results_cauchy_by_group.tsv.gz (per-group CCTs and
     direction summaries; input of v8/discovery). cauchy_phenoname: phenotype label written in that
     table (defaults to phenoname; pass the sex-tagged name for sex-specific runs).
+    flexrv_native: saige-slim FlexRV results; also exports one text file per max MAF tier and one
+    for the Cauchy rows.
     """
 
     hl.init(
@@ -706,7 +804,12 @@ def load_gene_data(directory: str,
     types = {x: hl.tint32 for x in ('MAC',	'Number_rare', 'Number_ultra_rare')}
     types.update({x: hl.tfloat64 for x in ('max_MAF', 'BETA_Burden', 'SE_Burden')})
     types.update({x: hl.tstr for x in p_value_fields})
-    if not phenoname.endswith('male'):
+    if flexrv_native:
+        single_assoc = sorted(m.path for m in hfs.ls(f'{directory}/*.result.singleAssoc.txt'))
+        if not single_assoc:
+            raise ValueError(f"No *.result.singleAssoc.txt files found under {directory}")
+        single_variant_ht = hl.import_table(single_assoc[0], delimiter='\t', impute=True, types = {'p.value':hl.tstr})
+    elif not phenoname.endswith('male'):
         single_variant_ht = hl.import_table(f'{directory}/result_{phenoname}_chr1_000065419.result.singleAssoc.txt', delimiter='\t', impute=True, types = {'p.value':hl.tstr})
     else:
         single_variant_ht = hl.import_table(f'{directory}/result_*_chrX_000276322.result.singleAssoc.txt', delimiter='\t', impute=True, types = {'p.value':hl.tstr})
@@ -738,21 +841,30 @@ def load_gene_data(directory: str,
     ht.describe()
     ht = ht.checkpoint(output_ht_path, overwrite=overwrite, _read_if_exists=not overwrite)
 
-    # one CCT per group (and ALL non-synonymous groups) over weights x tiers; SAIGE's own Cauchy row
-    # pools every group and stays in gene_results.ht unchanged
     if export_cauchy_by_group:
         export_group_cauchy(directory, f'{output_ht_directory}/{GROUP_CAUCHY_FILE}',
                             cauchy_phenoname or phenoname,
                             trait_type='continuous' if quantitative_trait else 'binary',
                             n_cases=n_cases, n_controls=n_controls)
 
-    if not phenoname.endswith('male') or phenoname.startswith('EM_202.2') or phenoname.startswith('EM_236.1') or phenoname.startswith('A10BJ'):
+    if flexrv_native:
+        max_maf_tiers, has_cauchy = ht.aggregate((
+            hl.agg.filter(hl.is_defined(ht.max_MAF), hl.agg.collect_as_set(ht.max_MAF)),
+            hl.agg.any(hl.is_missing(ht.max_MAF)),
+        ))
+        print(f'max_MAF tiers found: {sorted(max_maf_tiers)}; Cauchy rows: {has_cauchy}')
+        for max_MAF in sorted(max_maf_tiers, reverse=True):
+            ht.filter(ht.max_MAF == max_MAF).export(output_ht_path.replace('.ht', f'_{max_MAF}.txt.bgz'))
+        if has_cauchy:
+            ht.filter(hl.is_missing(ht.max_MAF)).export(output_ht_path.replace('.ht', '_cauchy.txt.bgz'))
+    if flexrv_native or not phenoname.endswith('male') or phenoname.startswith('EM_202.2') or phenoname.startswith('EM_236.1') or phenoname.startswith('A10BJ'):
         method = 'exact'
         success = output_ht_path.replace('.ht', f'_{method}_expected_p.ht/_SUCCESS')
         if not hl.hadoop_exists(output_ht_path):
             sys.exit(f'Output HT {output_ht_path} does not exist.')
         elif (hl.hadoop_exists(output_ht_path) and not hl.hadoop_exists(success)) or overwrite:
-            ht = create_expected_p_ht(pheno=phenoname, ancestry=ancestry, table_name='gene_results', analysis_type='gene', method='exact', overwrite=True, misc=misc)
+            ht = create_expected_p_ht(pheno=phenoname, ancestry=ancestry, table_name='gene_results', analysis_type='gene', method='exact', overwrite=True, misc=misc,
+                                      path=output_ht_path)
         else:
             ht = hl.read_table(output_ht_path.replace('.ht', f'_{method}_expected_p.ht'))
     ht.show()
@@ -896,7 +1008,8 @@ def load_variant_data(directory: str,
         if not hl.hadoop_exists(output_ht_path):
             sys.exit(f'Output HT {output_ht_path} does not exist.')
         elif (hl.hadoop_exists(output_ht_path) and not hl.hadoop_exists(success)) or overwrite:
-            ht = create_expected_p_ht(pheno=phenoname, ancestry=ancestry, table_name=f'{variant_type}_variant_results', analysis_type='variant', method='approx_cdf', overwrite=True, misc=misc)
+            ht = create_expected_p_ht(pheno=phenoname, ancestry=ancestry, table_name=f'{variant_type}_variant_results', analysis_type='variant', method='approx_cdf', overwrite=True, misc=misc,
+                                      path=output_ht_path)
             ht = ht.annotate(rsID=rsid_ht[ht.locus, ht.alleles].rsid)
         else:
             ht = hl.read_table(output_ht_path.replace('.ht', f'_{method}_expected_p.ht'))
@@ -1039,6 +1152,112 @@ def run_saige(
     p.write_output(run_saige_task.result, output_root)
     p.write_output(run_saige_task.stdout, f"{output_root}.{analysis_type}.log")
     return run_saige_task
+
+# Merges the per-call gene outputs: the first file's columns (NA where a call lacks one) plus
+# Run_group, the call a row came from. Tests of the Beta(1,25) calls (`betas`) get Weight `betaw`.
+MERGE_GROUP_CALLS_AWK = (
+    'BEGIN {FS="\t"; OFS="\t"; split(labs, lab, "|"); nb=split(betas, bl, "|"); '
+    'for (i=1; i<=nb; i++) isb[bl[i]]=1} '
+    'FNR==1 {fi++; for (k in m) delete m[k]; for (i=1; i<=NF; i++) m[$i]=i; '
+    'if (fi==1) {n=NF; for (i=1; i<=NF; i++) h[i]=$i; print $0, "Run_group"} next} '
+    '{line=""; for (i=1; i<=n; i++) {v=(h[i] in m) ? $(m[h[i]]) : "NA"; '
+    'if (h[i]=="Weight" && (lab[fi] in isb) && $(m["Group"])!="Cauchy") v=betaw; '
+    'line=line v OFS} print line lab[fi]}'
+)
+
+
+def run_saige_slim(
+    p: Batch,
+    phenoname: str,
+    ancestry: str,
+    output_root: str,
+    model_file: str,
+    variance_ratio_file: str,
+    sparse_grm_file: str,
+    geno_file: ResourceGroup,
+    group_file: str,
+    calls: list,
+    flexrv_score: str,
+    trait_type: str,
+    chrom: str,
+    max_maf: str,
+    memory: str = "10G",
+    storage: str = "10Gi",
+    r_corr: float = 1.0,
+    min_case_count: int = 0,
+    separation_check: str = "warn",
+):
+    """Gene-based step 2 on saige-slim (PGEN input) for flexRV_native.
+
+    One saige-slim call per (group, use_flexrv) in `calls` (see flexrv_native_calls), all on the
+    same scored group file, merged into one .gene.txt with a Run_group column. A call without
+    FlexRV is the default Beta(1,25) burden.
+    """
+    MKL_OFF = "export MKL_NUM_THREADS=1; export MKL_DYNAMIC=false; export OMP_NUM_THREADS=1; export OMP_DYNAMIC=false; "
+    j: Job = (
+        p.new_job(name=f"run_saige_gene_{phenoname}_{ancestry}", attributes={"analysis_type": "gene", "ancestry": ancestry})
+        .cpu(1)
+        .storage(storage)
+        .image(SAIGE_SLIM_DOCKER_IMAGE)
+        .memory(memory)
+    )
+    j.declare_resource_group(result={"gene.txt": "{root}", "result.singleAssoc.txt": "{root}.singleAssoc.txt"})
+    gene_out = j.result["gene.txt"]
+
+    # The pvar IDs are rewritten to the group files' CHROM:POS:REF:ALT, and plink2's chrPAR1/2 to
+    # chrX (otherwise the pseudoautosomal genes are dropped).
+    pvar = "pvar_chr_pos_ref_alt.pvar"
+    command = (
+        f"set -o pipefail; "
+        f"awk 'BEGIN {{OFS=\"\\t\"}} /^#/ {{print; next}} "
+        f"{{sub(/^chrPAR[12]$/, \"chrX\", $1); $3=$1\":\"$2\":\"$4\":\"$5; print}}' "
+        f"{geno_file.pvar} > {pvar}; "
+        f": > {j.stdout}; "
+        f"if [[ ! -s {group_file} ]]; then echo 'group file is empty: no gene of this ancestry in this interval. "
+        f"Rerun the launcher: intervals with an empty group file get no step-2 job.' | tee -a {j.stdout}; exit 1; fi; "
+    )
+    shared_flags = (
+        f"--GMMATmodelFile={model_file} --varianceRatioFile={variance_ratio_file} "
+        f"--pgenFile={geno_file.pgen} --pvarFile={pvar} --psamFile={geno_file.psam} --chrom={chrom} "
+        f"--groupFile={group_file} "
+        f"--sparseGRMFile={sparse_grm_file} --sparseGRMSampleIDFile={sparse_grm_file}.sampleIDs.txt "
+        f"--maxMissing=0.2 --minMAF=0 --minMAC=1 --r.corr={r_corr} "
+        f"--is_fastTest=FALSE --is_noadjCov=FALSE --LOCO=FALSE "
+        f"--is_output_markerList_in_groupTest=TRUE "
+        f"--cateVarRatioMinMACVecExclude=0.5,1.5,2.5,3.5,4.5,5.5,10.5,15.5,20.5 "
+        f"--cateVarRatioMaxMACVecInclude=1.5,2.5,3.5,4.5,5.5,10.5,15.5,20.5 "
+        f"--minCaseCount={min_case_count} --separationCheck={separation_check} "
+        + ("--is_output_moreDetails=TRUE " if trait_type == "binary" else "")
+    )
+    flexrv_flags = (f"--flexRV_score={flexrv_score} --flexRV_maxMAF={max_maf} --flexRV_lofAnno=pLoF "
+                    f"--is_output_nEff=TRUE ")
+    parts, labels = [], []
+    for k, (entry, use_flexrv) in enumerate(calls):
+        parts.append(f"${{BATCH_TMPDIR}}/group_call_{k}")
+        labels.append(entry.replace(':', ';'))
+        command += (
+            f"echo '===== step 2, group {labels[-1]} =====' | tee -a {j.stdout}; "
+            f"{MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R "
+            f"--SAIGEOutputFile={parts[-1]} --annotation_in_groupTest={entry} {shared_flags}"
+            # single-variant tests do not depend on the group: run them in the first call only
+            + f"--is_single_in_groupTest={'TRUE' if k == 0 else 'FALSE'} "
+            + (flexrv_flags if use_flexrv else f"--maxMAF_in_groupTest={max_maf} ")
+            + f"2>&1 | tee -a {j.stdout}; "
+        )
+    beta_labels = "|".join(lab for lab, (_, use_flexrv) in zip(labels, calls) if not use_flexrv)
+    command += (
+        f"awk -v 'labs={'|'.join(labels)}' -v 'betas={beta_labels}' -v 'betaw={DEFAULT_SAIGE_WEIGHT}' "
+        f"'{MERGE_GROUP_CALLS_AWK}' {' '.join(parts)} > {gene_out}; "
+        f"cp {parts[0]}.singleAssoc.txt {j.result['result.singleAssoc.txt']}; "
+        f"if [[ $(wc -l < {group_file}) -gt 0 && $(wc -l < {gene_out}) -le 1 ]]; then "
+        f"echo 'group file not empty but no gene tested' | tee -a {j.stdout}; exit 1; fi"
+    )
+    j.command(command)
+
+    p.write_output(j.result, output_root)
+    p.write_output(j.stdout, f"{output_root}.gene.log")
+    return j
+
 
 def fit_null_glmm(
     p: Batch,
@@ -1257,7 +1476,6 @@ def export_bgen_from_mt(
 def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_dir,
                            top_pct=None):
     MIN_VARIANTS = 2
-    MISSENSE_ANNOTATIONS = {'missenseother_missense', 'missenseLC'}
 
 
     if gene_map_source not in GENE_MAP_SOURCES:
@@ -1302,13 +1520,13 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
             group_ht.tag.split(',')[0],
             group_ht.tag,
         )
-        # Weight-scheme label after ',' (e.g. 'cubic_root_t0.2__maf_beta_b2.0' for flexRV)
         tag_suffix_str = hl.if_else(
             group_ht.tag.contains(','),
             group_ht.tag.split(',')[1],
             '',
         )
-        base_order = hl.dict({'var': 0, 'anno': 1, 'weight': 2})
+        # saige-slim needs the score line right after anno
+        base_order = hl.dict({'var': 0, 'anno': 1, 'score': 2, 'weight': 3})
         group_ht = group_ht.annotate(
             tag_rank=base_order[tag_base],
             tag_suffix=tag_suffix_str,
@@ -1383,7 +1601,52 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
     gene_ht = hl.read_table(gene_ht_path)
     gene_ht = hl.filter_intervals(gene_ht, [interval])
 
-    if mode == 'weighted' and top_pct is not None:
+    if mode == 'flexRV_native':
+        # One `score,<NAME>` line for saige-slim's FlexRV; missense + pLoF variants only.
+        # Score: target_col for missense (gene mean where missing), 1.0 for pLoF.
+        weight_array_expr = resolve_weight_array_expr(gene_ht, target_col)
+        gene_mean_ht = compute_gene_missense_mean(gene_ht, weight_array_expr, target_col)
+
+        gene_ht = gene_ht.filter(is_missense_annotation_expr(gene_ht) | (gene_ht.annotation == 'pLoF'))
+        gene_ht = gene_ht.annotate(
+            gene_mean_score=hl.or_else(gene_mean_ht[gene_label(gene_ht)].gene_mean, hl.float64(0))
+        )
+        raw = weight_array_expr(gene_ht).map(
+            lambda w: hl.or_else(hl.float64(w[target_col]), gene_ht.gene_mean_score)
+        )
+        unit = gene_ht.variants.map(lambda _: hl.float64(1.0))
+        gene_ht = gene_ht.annotate(
+            annotation_repeated=hl.map(lambda _: gene_ht.annotation, gene_ht.variants),
+            score=hl.if_else(is_missense_annotation_expr(gene_ht), raw, unit),
+        )
+        grouped_ht = group_by_gene(
+            gene_ht,
+            extra_aggs={
+                'annotation_repeated': hl.flatten(hl.agg.collect(gene_ht.annotation_repeated)),
+                'score': hl.flatten(hl.agg.collect(gene_ht.score)),
+            },
+        )
+        grouped_ht = grouped_ht.filter(hl.len(grouped_ht.variants) >= MIN_VARIANTS)
+
+        var_ht = (grouped_ht
+            .select(tag='var', info=hl.delimit(grouped_ht.variants, ' '))
+            .key_by())
+        anno_ht = (grouped_ht
+            .select(tag='anno', info=hl.delimit(grouped_ht.annotation_repeated, ' '))
+            .key_by())
+        score_ht = (grouped_ht
+            .select(tag=f'score,{target_col.upper()}',
+                    info=hl.delimit(grouped_ht.score.map(hl.str), ' '))
+            .key_by())
+
+        finalize_and_export(
+            var_ht,
+            anno_ht,
+            weight_ht=score_ht,
+            output_path=output_dir,
+        )
+
+    elif mode == 'weighted' and top_pct is not None:
         # Threshold variant of 'weighted': target_col only *selects* missense variants,
         # it is not written out, so the group file has var/anno lines and no weight line.
         #
@@ -1491,17 +1754,9 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
             output_path = output_dir
         )
 
-    elif mode in GROUP_FILE_MODE_ALIASES:
-        raise ValueError(
-            f"Mode '{mode}' exports no group files of its own -- it reuses the "
-            f"'{GROUP_FILE_MODE_ALIASES[mode]}' group files. Export those with "
-            f"--saige-gene-mode {GROUP_FILE_MODE_ALIASES[mode]} instead."
-        )
-
     else:
         raise ValueError(
-            f"Unknown mode '{mode}'. Expected 'unguided' or 'weighted' "
-            f"(FlexRV modes are not ported to this pipeline)."
+            f"Unknown mode '{mode}'. Expected one of {SAIGE_GENE_MODES}."
         )
 
 
@@ -1869,17 +2124,35 @@ def main(args):
         print(f'Analysis type: {analysis_type}')
         print(f'Variant_type: {variant_type}')
 
-        # Image and group-file source both follow from the mode, so neither has to
-        # be switched by hand when moving between flexRV and the legacy no-weights run.
-        saige_docker_image = resolve_saige_docker_image(args.saige_gene_mode)
-        group_file_mode = resolve_group_file_mode(args.saige_gene_mode)
+        flexrv_native = args.saige_gene_mode == 'flexRV_native' and analysis_type == 'gene'
+        saige_docker_image = SAIGE_SLIM_DOCKER_IMAGE if flexrv_native else SAIGE_DOCKER_IMAGE
         print(f"Docker image: {saige_docker_image}...")
         if analysis_type == 'gene':
             print(f"Set-based test: --r.corr={args.r_corr} "
                   f"(p-value columns discovered from output header at load time)")
-        if group_file_mode != args.saige_gene_mode:
-            print(f"Group files: reusing '{group_file_mode}' mode directory "
-                  f"(mode '{args.saige_gene_mode}' carries no weights)")
+
+        if args.groups is None:
+            args.groups = "pLoF:missenseLC" if flexrv_native else "pLoF,missenseLC,synonymous,pLoF:missenseLC"
+        if args.max_maf_group is None:
+            args.max_maf_group = "0.001" if flexrv_native else "0.01,0.001,0.0001"
+        if args.saige_gene_mode == 'weighted' and args.saige_gene_weight is None:
+            raise ValueError("--saige-gene-mode weighted needs --saige-gene-weight")
+        native_calls = None
+        if flexrv_native:
+            if args.saige_gene_weight is None:
+                raise ValueError("--saige-gene-mode flexRV_native needs --saige-gene-weight (the score)")
+            if args.sex != 'both' or args.gate_only:
+                raise ValueError("flexRV_native supports neither sex-specific nor time-to-event runs "
+                                 "(saige-slim: binary and quantitative traits only)")
+            # FlexRV's MAF weights are scaled to one cut-off (--flexRV_maxMAF)
+            if args.max_maf_group.strip() != "0.001":
+                raise ValueError(f"flexRV_native runs at max MAF 0.001 only; got --max-maf-group {args.max_maf_group!r}")
+            if not args.pgen:
+                print("flexRV_native: saige-slim reads PGEN only, switching --pgen on")
+                args.pgen = True
+            native_calls = flexrv_native_calls(args.groups)
+            print("flexRV_native groups: "
+                  + ", ".join(f"{e} ({'FlexRV' if fx else 'Beta(1,25)'})" for e, fx in native_calls))
 
         if args.saige_gene_top_pct is not None:
             if args.saige_gene_mode != 'weighted':
@@ -1894,8 +2167,8 @@ def main(args):
             print(f"Thresholding: keeping missense variants in the top {args.saige_gene_top_pct:g} "
                   f"of their gene by {args.saige_gene_weight}; group files carry no weight lines")
 
-        group_file_subdir = resolve_mode_subdir(group_file_mode, args.saige_gene_weight, args.saige_gene_top_pct)
-        result_subdir = resolve_mode_subdir(args.saige_gene_mode, args.saige_gene_weight, args.saige_gene_top_pct)
+        group_file_subdir = result_subdir = resolve_mode_subdir(
+            args.saige_gene_mode, args.saige_gene_weight, args.saige_gene_top_pct)
 
         RESULT_ROOT = f'{RESULTS_PATH}/{software_type}{analysis_type}_results{"" if not args.misc_test else "_misc"}'
         EXTERNAL_RESULT_ROOT = f'{EXTERNAL_ANALYSIS_BUCKET}/{software_type}{analysis_type}_results{"" if not args.misc_test else "_misc"}'
@@ -1944,7 +2217,7 @@ def main(args):
             b = hb.Batch(
                 name=f"saige_{analysis_type}_aou_{ancestry}{sex_tag}",
                 backend=backend,
-                default_image=saige_docker_image,
+                default_image=SAIGE_DOCKER_IMAGE,
                 default_storage="500Mi",
                 default_cpu=n_threads,
                 default_regions=['us-central1']
@@ -2034,7 +2307,7 @@ def main(args):
                             trait_type=current_trait_type,
                             covariates=covariates,
                             plink_file_root=f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink',
-                            docker_image=saige_docker_image,
+                            docker_image=SAIGE_DOCKER_IMAGE,
                             variant_type=variant_type,
                             sparse_grm=sparse_grm,
                             sparse_grm_extension=sparse_grm_extension,
@@ -2085,8 +2358,18 @@ def main(args):
                 if not overwrite_groupfile and hfs.exists(amc_bgen_dir):
                     groupfile_already_created = {x["path"] for x in hl.hadoop_ls(amc_bgen_dir) if x["path"].endswith(".txt")}
                 print(f'Found {len(groupfile_already_created)} groupFiles in directory...')
+                # An interval with no gene of this ancestry (e.g. AMR chrY: no gene-map rows) gets a 0-byte
+                # group file, which saige-slim cannot read ("has no score line"): such intervals get no step-2
+                # job, unless the group file is rebuilt in this batch (run_saige_slim then stops with a clear message).
+                empty_group_files = set()
+                if analysis_type == 'gene' and not overwrite_groupfile and hfs.exists(amc_bgen_dir):
+                    empty_group_files = {x["path"] for x in hl.hadoop_ls(amc_bgen_dir)
+                                         if x["path"].endswith(".gene.txt") and x["size_bytes"] == 0}
+                if empty_group_files:
+                    print(f'Empty groupFiles (no step 2): {sorted(empty_group_files)}')
 
                 genos = {}
+                gene_txt_tasks = {}
                 if args.test:
                     if ancestry.lower() == 'eur':
                         intervals = [hl.Interval(
@@ -2147,15 +2430,7 @@ def main(args):
                         bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
 
-                    if group_file_mode != args.saige_gene_mode and analysis_type == 'gene':
-                        if args.overwrite_gene_txt:
-                            logger.warning(
-                                f"--overwrite-gene-txt ignored for mode "
-                                f"'{args.saige_gene_mode}': it reuses the "
-                                f"'{group_file_mode}' group files. Re-export with "
-                                f"--saige-gene-mode {group_file_mode}."
-                            )
-                    elif ((f"{amc_group_file_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
+                    if ((f"{amc_group_file_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
                         gene_txt_task = b.new_python_job(
                             name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
                         )
@@ -2172,6 +2447,7 @@ def main(args):
                         )
                         gene_txt_task.attributes["ancestry"] = ancestry
                         gene_txt_task.attributes["analysis_type"] = analysis_type
+                        gene_txt_tasks[str(interval)] = gene_txt_task
 
                     if (not hfs.exists(f"{bgen_root}.bgen.bgi")) and  (hfs.exists(f"{bgen_root}.bgen")):
                         bgen_index=index_bgen(b=b, ancestry=ancestry, analysis_type=analysis_type, bgen=f"{bgen_root}.bgen")
@@ -2298,6 +2574,8 @@ def main(args):
                         and hfs.exists(pheno_results_dir)
                     ):
                         results_already_created = {x["path"] for x in hl.hadoop_ls(pheno_results_dir)}
+                        if native_calls is not None:
+                            check_result_groups(pheno_results_dir, native_calls, results_already_created)
                     if (
                             not args.overwrite_exome_results
                             and hfs.exists(pheno_results_dir) and analysis_type == 'gene'
@@ -2313,6 +2591,10 @@ def main(args):
                         if (sex_tag != '') and (interval.start.contig != 'chrX') and (phenoname not in ['EM_202.2', 'EM_236.1', 'A10BJ', 'A10BJ06']):
                             continue
                         results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
+                        if (analysis_type == 'gene' and str(interval) not in gene_txt_tasks and
+                                f"{amc_bgen_dir}/{analysis_type}_{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}.gene.txt"
+                                in empty_group_files):
+                            continue
                         group_file = None
                         max_maf_for_group_test = None
                         sparse_grm_file = None
@@ -2325,11 +2607,40 @@ def main(args):
                             geno_file = genos[str(interval)]
                         samples_file = b.read_input(f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
 
-                        if (
+                        run_interval = (
                             overwrite_results
                             or (f"{results_path}.{'gene' if analysis_type == 'gene' else 'single_variant'}.txt"
                             not in results_already_created)
-                        ):
+                        )
+                        if run_interval and flexrv_native:
+                            saige_task = run_saige_slim(
+                                p=b,
+                                phenoname=phenoname,
+                                ancestry=ancestry,
+                                output_root=results_path,
+                                model_file=model_file,
+                                variance_ratio_file=variance_ratio_file,
+                                sparse_grm_file=sparse_grm_file,
+                                geno_file=geno_file,
+                                group_file=group_file,
+                                calls=native_calls,
+                                flexrv_score=args.saige_gene_weight.upper(),
+                                trait_type=current_trait_type,
+                                chrom=interval.start.contig,
+                                max_maf=max_maf_for_group_test,
+                                memory='26G' if args.highhighmem else '10G',
+                                r_corr=args.r_corr,
+                                min_case_count=args.slim_min_case_count,
+                                separation_check=args.slim_separation_check,
+                            )
+                            saige_task.attributes.update(
+                                {"interval": str(interval), "ancestry": ancestry, 'name': 'saigeTrue',
+                                 "phenotype": copy.deepcopy(phenoname), "pheno_sex": copy.deepcopy(sex_to_run)}
+                            )
+                            saige_tasks[phenoname].append(saige_task)
+                            if str(interval) in gene_txt_tasks:
+                                saige_task.depends_on(gene_txt_tasks[str(interval)])
+                        elif run_interval:
                             saige_task = run_saige(
                                 p=b,
                                 phenoname=f'{phenoname}{sex_tag}',
@@ -2362,8 +2673,11 @@ def main(args):
                                 {"phenotype": copy.deepcopy(phenoname), "pheno_sex": copy.deepcopy(sex_to_run)}
                             )
                             saige_tasks[f'{phenoname}{sex_tag}'].append(saige_task)
+                            if str(interval) in gene_txt_tasks:
+                                saige_task.depends_on(gene_txt_tasks[str(interval)])
 
-                        if analysis_type == 'gene':
+                        # flexRV_native: saige-slim already writes the single-variant results
+                        if analysis_type == 'gene' and not flexrv_native:
                             if (
                                     args.overwrite_exome_results
                                     or (f"{results_path}_exome.single_variant.txt" not in exome_results_already_created)
@@ -2421,6 +2735,12 @@ def main(args):
 
                     quantitative_trait = phenoname in quantitative_traits
    
+                    if native_calls is not None and args.skip_saige:
+                        if not hfs.exists(directory):
+                            logger.warning(f"[{ancestry.upper()}: {phenoname}] no SAIGE results under {directory}; nothing loaded")
+                            continue
+                        check_result_groups(directory, native_calls)
+
                     if not args.skip_load_gene_results and analysis_type == 'gene':
                         ht_done = hfs.exists(f'{output_ht_directory}/gene_results_exact_expected_p.ht/_SUCCESS')
                         cct_done = args.skip_group_cauchy or group_cauchy_is_current(
@@ -2463,12 +2783,13 @@ def main(args):
                                    misc=args.misc_test,
                                    export_cauchy_by_group=not args.skip_group_cauchy,
                                    cauchy_phenoname=f'{phenoname}{sex_tag}',
+                                   flexrv_native=flexrv_native,
                                    )
                             if phenoname in list(saige_tasks.keys()) and not args.skip_saige:
                                 j.depends_on(*saige_tasks[f'{phenoname}{sex_tag}'])
                             j.always_run()
 
-                    if not args.skip_load_variant_results:
+                    if not args.skip_load_variant_results and not flexrv_native:
                         extension = 'single_variant.txt'
                         variant_type = 'genome' if analysis_type == 'variant' else 'exome'
                         SUCCESS = hfs.exists(f'{output_ht_directory}/{variant_type}_variant_results.ht/_SUCCESS') and hfs.exists(f'{output_ht_directory}/{variant_type}_variant_results_approx_cdf_expected_p.txt.bgz')
@@ -2911,8 +3232,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--groups",
-        help="Comma-separated list of functional groups used for gene-based test ",
-        default="pLoF,missenseLC,synonymous,pLoF:missenseLC",
+        help="Comma-separated list of functional groups used for gene-based test. "
+             "Default: pLoF,missenseLC,synonymous,pLoF:missenseLC; flexRV_native: pLoF:missenseLC "
+             "(one saige-slim call per entry: FlexRV for entries with a missense annotation, "
+             "Beta(1,25) burden for pLoF)",
+        default=None,
     )
     parser.add_argument(
         "--saige-gene-weight",
@@ -2921,8 +3245,25 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--saige-gene-mode",
-        help="Mode to create gene groups that will be used for saige analysis",
+        help="Mode to create gene groups that will be used for saige analysis: unguided (no weights), "
+             "weighted (one weight line, --saige-gene-weight) or flexRV_native (saige-slim's built-in "
+             "FlexRV on the --saige-gene-weight score)",
+        choices=SAIGE_GENE_MODES,
         default='unguided',
+    )
+    parser.add_argument(
+        "--slim-min-case-count",
+        help="flexRV_native only: saige-slim --minCaseCount. saige-slim's own default (100) refuses "
+             "rarer binary traits; 0 runs them all",
+        default=0,
+        type=int,
+    )
+    parser.add_argument(
+        "--slim-separation-check",
+        help="flexRV_native only: saige-slim --separationCheck (what to do when a binary null model "
+             "has many fitted values at 0/1). saige-slim's own default is 'error'",
+        choices=["error", "warn", "none"],
+        default="warn",
     )
     parser.add_argument(
         "--saige-gene-map-source",
@@ -2953,8 +3294,7 @@ if __name__ == "__main__":
         "--load-gene-results", help="Load gene level test results", action="store_true"
     )
     parser.add_argument(
-        "-hail-image", help="hail docker image to use", action="store_true",
-        # default='us-central1-docker.pkg.dev/broad-mpg-gnomad/images/vrs084'
+        "--hail-image", help="hail docker image to use",
         default ='hailgenetics/hail:0.2.133-py3.11'
     )
     parser.add_argument(
@@ -2979,8 +3319,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max-maf-group",
-        help="Max MAF of variants to include into the group tests",
-        default='0.01,0.001,0.0001',
+        help="Max MAF of variants to include into the group tests. Default: 0.01,0.001,0.0001; "
+             "flexRV_native: 0.001 (the only value it accepts)",
+        default=None,
     )
     parser.add_argument(
         "--category",

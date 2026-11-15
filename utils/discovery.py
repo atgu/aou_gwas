@@ -9,6 +9,14 @@ Attribution is asked only of genes selected on the missense-only test. pLoF and 
 practice, different people, so the pLoF test is independent of the selection and its p is read directly,
 with no selection adjustment.
 
+Minimum pLoF allele count (--plof-min-mac, default 5): a pLoF test on fewer than 5 minor alleles is
+treated as not run and the gene is classed pLoF_MAC_lt5. Such a test rests on one to four carriers; on
+height, two reached p < 2.5e-6 with a single allele each. The pipeline does not remove them (saige-slim
+tests a group at any allele count, and the production v8 SKAT-O output also contains them), so the rule
+lives here. It applies to real and null phenotypes and to both runs. It does not touch the missense or
+combined p-values, so it changes the evidence and attribution labels of a hit, never the hit list. The
+novelty label still uses the unfiltered production pLoF p.
+
 Run
 ---
     python utils/discovery.py \\
@@ -54,6 +62,10 @@ NULL_FPR_MIN_PREV = 5e-4
 FPRS = (1e-4, 1e-3)
 MB = [0, None, 1e-4, 1e-2, 0.1, 1.0000001]          # missense CCT bins; None is replaced by alpha
 MBL = ["<alpha", "alpha-1e-4", "1e-4-0.01", "0.01-0.1", ">0.1"]
+# A pLoF test on fewer than this many minor alleles is treated as not run (class pLoF_MAC_lt5). SAIGE
+# itself may emit such tests (saige-slim tests a group at any allele count; production v8 SKAT-O output
+# also has them), so the rule is applied here, to real and null phenotypes and to both runs alike.
+PLOF_MIN_MAC = 5
 ATTR_SET_CALLS = ["LoF_like_strict", "LoF_like_suggestive", "not_LoF_like"]
 
 
@@ -105,13 +117,18 @@ def cct_meta(c: pd.DataFrame) -> dict:
     return {k: c[k].iloc[0] for k in META_COLS if k in c.columns and len(c) and pd.notna(c[k].iloc[0])}
 
 
-def gene_table(c: pd.DataFrame, pheno: str) -> pd.DataFrame:
+def gene_table(c: pd.DataFrame, pheno: str, plof_min_mac: float = PLOF_MIN_MAC) -> pd.DataFrame:
     """Per-gene table of one phenotype from its per-group CCT table.
 
       p_{plof,mis,comb}_cct  Pvalue_cct of pLoF (Beta_1_25 only), missenseLC, pLoF;missenseLC
       s_mis        shared sign of the missense tests with p < 0.05 (all tests if none is nominal); 0 = ambiguous
       p_plof_dir   pLoF Pvalue_cct_pos if s_mis = +1, Pvalue_cct_neg if s_mis = -1
-      plof_mac_lt5 pLoF carriers exist (combined MAC > missense MAC) but SAIGE emitted no pLoF test
+      plof_mac_lt5 pLoF carriers exist but there is no usable pLoF test: SAIGE emitted none (combined MAC >
+                   missense MAC), or its MAC is below `plof_min_mac`
+      p_plof_cct_all  pLoF Pvalue_cct before the `plof_min_mac` rule (used only for the novelty label)
+
+    pLoF tests with MAC < `plof_min_mac` are set to missing in p_plof_cct and p_plof_dir (0 = keep all).
+    The missense and combined p-values are never filtered.
     """
     c = c[c.Group.isin(GROUPS)]
     w = c[["gene_id", "gene_symbol"]].drop_duplicates("gene_id")
@@ -141,17 +158,20 @@ def gene_table(c: pd.DataFrame, pheno: str) -> pd.DataFrame:
     })
     out["p_plof_dir"] = np.select([out.s_mis == 1, out.s_mis == -1],
                                   [w.Pvalue_cct_pos_plof.values, w.Pvalue_cct_neg_plof.values], np.nan)
-    out["plof_mac_lt5"] = out.p_plof_cct.isna() & ((w.MAC_comb - w.MAC_mis.fillna(0)).values > 0)
+    out["p_plof_cct_all"] = out.p_plof_cct
+    low = (out.MAC_plof < plof_min_mac).to_numpy()
+    out.loc[low, ["p_plof_cct", "p_plof_dir"]] = np.nan
+    out["plof_mac_lt5"] = out.p_plof_cct.isna() & (low | ((w.MAC_comb - w.MAC_mis.fillna(0)).values > 0))
     return out
 
 
-def cct_loader(root: str) -> Callable[[str], Optional[pd.DataFrame]]:
+def cct_loader(root: str, plof_min_mac: float = PLOF_MIN_MAC) -> Callable[[str], Optional[pd.DataFrame]]:
     """pheno -> gene_table, reading `root`. load.meta(pheno) reads only the pipeline-written metadata."""
     files = list_cct_files(root)
 
     def load(pheno):
         c = read_cct(files[pheno]) if pheno in files else None
-        return None if c is None else gene_table(c, pheno)
+        return None if c is None else gene_table(c, pheno, plof_min_mac)
 
     def meta(pheno):
         c = read_cct(files[pheno], nrows=1) if pheno in files else None
@@ -287,8 +307,10 @@ def _cross(tables: dict) -> dict:
     """Production p-values (novelty) and the other method's combined p onto each method's table."""
     prod = tables.get("production")
     if prod is not None:
-        ref = prod[["gene_id", "p_plof_cct", "p_mis_cct", "p_comb_cct"]].drop_duplicates("gene_id").rename(
-            columns={"p_plof_cct": "PROD_plof", "p_mis_cct": "PROD_mis", "p_comb_cct": "PROD_plof_mis"})
+        # novelty uses the production pLoF p before the minimum-MAC rule: a gene production already
+        # reports is not "new", however few alleles its test rests on
+        ref = prod[["gene_id", "p_plof_cct_all", "p_mis_cct", "p_comb_cct"]].drop_duplicates("gene_id").rename(
+            columns={"p_plof_cct_all": "PROD_plof", "p_mis_cct": "PROD_mis", "p_comb_cct": "PROD_plof_mis"})
     out = {}
     for m, d in tables.items():
         if prod is not None:
@@ -826,6 +848,9 @@ def main(argv=None):
                          "candidates_*.parquet (default: alpha)")
     ap.add_argument("--check-n", type=int, default=5000,
                     help="gene x pheno pairs sampled per real phenotype for the pLoF-vs-production check")
+    ap.add_argument("--plof-min-mac", type=float, default=PLOF_MIN_MAC,
+                    help="pLoF tests with fewer minor alleles are treated as not run (class pLoF_MAC_lt5); "
+                         "applied to both runs, real and null phenotypes. 0 keeps every test")
     ap.add_argument("--skip-figures", action="store_true", help="tables only")
     ap.add_argument("--figures-only", action="store_true", help="redraw the figures from an existing --out")
     args = ap.parse_args(argv)
@@ -835,11 +860,12 @@ def main(argv=None):
             ap.error("--weighted-root is required (unless --figures-only)")
         os.makedirs(args.out, exist_ok=True)
         say = Log(os.path.join(args.out, "report_log.txt"))
-        loaders = {"weighted": cct_loader(args.weighted_root)}
+        loaders = {"weighted": cct_loader(args.weighted_root, args.plof_min_mac)}
         if args.production_root:
-            loaders["production"] = cct_loader(args.production_root)
+            loaders["production"] = cct_loader(args.production_root, args.plof_min_mac)
         meta = build_meta(args, loaders)
         say(f"weighted: {args.weighted_root}\nproduction: {args.production_root or '-'}")
+        say(f"pLoF tests with MAC < {args.plof_min_mac:g} are treated as not run (--plof-min-mac)")
         col, thr = collect(loaders, meta, args.alpha, args.keep_p, args.check_n, log=say)
         report(col, thr, meta, args.out, args.alpha, say)
     if not args.skip_figures:
