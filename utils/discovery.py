@@ -17,12 +17,29 @@ lives here. It applies to real and null phenotypes and to both runs. It does not
 combined p-values, so it changes the evidence and attribution labels of a hit, never the hit list. The
 novelty label still uses the unfiltered production pLoF p.
 
+Minimum effective carrier count (--min-neff, default 10): a FlexRV weight set whose burden test has
+nEff_Burden below 10 rests on a handful of carriers, and on quantitative traits such sets produce
+combined-mask p-values of 1e-8 and below that neither the pLoF nor the missense test supports. They are
+dropped and each group's CCT, direction summaries and top test are recomputed, with equal weights, over
+the weight sets that remain; a group left with no set counts as not tested. Tests without nEff_Burden
+(the Beta(1,25) pLoF test) are kept. The per-group table holds only the CCT over all sets, so the rule
+is applied from the per-weight-set exports next to it (`gene_results_<max_MAF>.txt.bgz`, written for
+flexRV_native runs; about 100-200 MB per phenotype, which is what makes the report slower than with
+--min-neff 0). A run without those exports (other gene modes, flat copies) is used as is, and the log says
+so. The meta-analysis table is never refiltered: --create-flexrv-meta applied the same rule
+(--meta-min-neff) in each ancestry before combining them. It also blanks pLoF tests on fewer than 5 pooled
+alleles itself (--meta-plof-min-mac; the value stays in Pvalue_meta_cct_unfiltered, which this report
+does not read), so on a meta table --plof-min-mac removes nothing further at the default.
+
 Run
 ---
     python utils/discovery.py \\
         --weighted-root   gs://.../ht_results/<map_source>/<mode>/<WEIGHT>/EUR \\
         --production-root <ht_results ancestry root of the unweighted run>    # optional: novelty, comparison
         --out discovery_EUR
+    python utils/discovery.py \\
+        --weighted-root   gs://.../ht_results/<map_source>/flexRV_native/<WEIGHT>/META \\
+        --out discovery_META                                                  # cross-ancestry meta-analysis
     python utils/discovery.py --out discovery_EUR --figures-only              # redraw the figures
 
 
@@ -41,6 +58,7 @@ Outputs (--out)
 """
 import argparse
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -50,9 +68,23 @@ from scipy import stats
 
 ALPHA = 2.5e-6
 CCT_FILE = "gene_results_cauchy_by_group.tsv.gz"
+# Cross-ancestry FlexRV meta-analysis table (--create-flexrv-meta); read when a phenotype directory
+# has no per-ancestry table, with its columns renamed to the per-ancestry names. One "test" of a
+# group is then one weight set meta-analysed across ancestries (signed Stouffer), MAC is summed over
+# the ancestries, and n_cases / n_controls are totals. It has no BETA_top / SE_top (Z_top instead).
+META_FILE = "gene_results_flexrv_meta.tsv.gz"
+# Cross-ancestry meta-analysis of the unweighted production run (--create-meta-analysis-ht export):
+# one row per gene x mask x max MAF tier with the signed Stouffer burden statistic META_Stats_Burden and
+# its two-sided Pvalue_Burden. Read last, and turned into the per-group layout by production_meta_cct().
+PROD_META_FILE = "gene_results.txt.bgz"
+META_RENAME = {"Pvalue_meta_cct": "Pvalue_cct", "Pvalue_meta_cct_pos": "Pvalue_cct_pos",
+               "Pvalue_meta_cct_neg": "Pvalue_cct_neg", "n_sets": "n_tests"}
 GROUPS = {"pLoF": "plof", "missenseLC": "mis", "pLoF;missenseLC": "comb"}
 GROUP_VALUES = ["MAC", "n_tests", "Pvalue_cct", "Pvalue_cct_pos", "Pvalue_cct_neg", "n_pos", "n_neg",
-                "n_pos_nom", "n_neg_nom", "BETA_top", "SE_top", "max_MAF_top"]
+                "n_pos_nom", "n_neg_nom", "BETA_top", "SE_top", "Z_top", "max_MAF_top"]
+# without these a table cannot be used (a meta table written before the direction summaries were added)
+REQUIRED = ["Pvalue_cct", "Pvalue_cct_pos", "Pvalue_cct_neg", "n_pos", "n_neg", "n_pos_nom", "n_neg_nom",
+            "MAC", "n_tests"]
 META_COLS = ["trait_type", "n_cases", "n_controls"]
 # binary null phenotypes with at least this case fraction form the empirical null of the directional pLoF
 # p (nominal prevalence >= 1%; the 0.5 margin absorbs sampling, e.g. 2265 / 227273 = 0.00997)
@@ -66,6 +98,11 @@ MBL = ["<alpha", "alpha-1e-4", "1e-4-0.01", "0.01-0.1", ">0.1"]
 # itself may emit such tests (saige-slim tests a group at any allele count; production v8 SKAT-O output
 # also has them), so the rule is applied here, to real and null phenotypes and to both runs alike.
 PLOF_MIN_MAC = 5
+# FlexRV weight sets with nEff_Burden below this are dropped before the per-group CCT (see the module
+# docstring); same value as FLEXRV_META_MIN_NEFF of the pipeline's cross-ancestry meta-analysis.
+MIN_NEFF = 10.0
+TIER_FILE = re.compile(r"gene_results_[0-9][0-9.eE+-]*\.txt\.bgz")     # per-weight-set export of one max MAF tier
+SIGN_P = 0.05                                                         # as in the pipeline's per-group table
 ATTR_SET_CALLS = ["LoF_like_strict", "LoF_like_suggestive", "not_LoF_like"]
 
 
@@ -80,8 +117,11 @@ def _fs():
 def list_cct_files(root: str) -> Dict[str, str]:
     """{phenotype: path} under a results root.
 
-    Accepts an ht_results ancestry root (`phenotype_<X>/gene_results_cauchy_by_group.tsv.gz`) or a flat
-    directory of `<X>.tsv.gz` copies. Existence of the per-phenotype file is checked when it is read.
+    Accepts an ht_results ancestry root (`phenotype_<X>/gene_results_cauchy_by_group.tsv.gz`), the META
+    root of the cross-ancestry FlexRV meta-analysis (`phenotype_<X>/gene_results_flexrv_meta.tsv.gz`), the
+    META root of the production run (`phenotype_<X>/gene_results.txt.bgz`), or a flat directory of
+    `<X>.tsv.gz` copies. Existence of the per-phenotype file is checked when it is read; under
+    `phenotype_<X>/` the per-ancestry table is tried first, then the two meta-analysis tables.
     """
     out = {}
     if root.startswith("gs://"):
@@ -91,7 +131,7 @@ def list_cct_files(root: str) -> Dict[str, str]:
     for p in sorted(names):
         b = os.path.basename(p)
         if b.startswith("phenotype_"):
-            out[b[len("phenotype_"):]] = f"{p}/{CCT_FILE}"
+            out[b[len("phenotype_"):]] = f"{p}/{CCT_FILE}|{p}/{META_FILE}|{p}/{PROD_META_FILE}"
         elif b.endswith(".tsv.gz"):
             out[b[:-len(".tsv.gz")]] = p
     return out
@@ -99,17 +139,151 @@ def list_cct_files(root: str) -> Dict[str, str]:
 
 def read_cct(path: str, nrows: int = None) -> Optional[pd.DataFrame]:
     """One phenotype's per-group CCT table, restricted to the columns used; None if absent."""
-    want = set(["phenoname", "gene_id", "gene_symbol", "Group"] + GROUP_VALUES + META_COLS)
+    want = set(["phenoname", "gene_id", "gene_symbol", "Group"] + GROUP_VALUES + META_COLS) | set(META_RENAME)
     kw = dict(sep="\t", usecols=lambda c: c in want, dtype={"phenoname": str, "trait_type": str}, nrows=nrows)
+    for one in path.split("|"):
+        if os.path.basename(one) == PROD_META_FILE:
+            c = production_meta_cct(one, nrows)
+            if c is None:
+                continue
+            c.attrs["is_meta"], c.attrs["directory"] = "production", os.path.dirname(one)
+            return c
+        try:
+            if one.startswith("gs://"):
+                with _fs().open(one, "rb") as f:
+                    c = pd.read_csv(f, compression="gzip", **kw)
+            else:
+                c = pd.read_csv(one, **kw)
+        except FileNotFoundError:
+            continue
+        c = c.rename(columns=META_RENAME)
+        c.attrs["is_meta"] = os.path.basename(one) == META_FILE
+        c.attrs["directory"] = os.path.dirname(one) if os.path.basename(one) in (META_FILE, CCT_FILE) else None
+        miss = [k for k in REQUIRED if k not in c.columns]
+        if miss:
+            raise ValueError(f"{one} lacks {', '.join(miss)}: " + (
+                "this meta-analysis table predates the direction summaries, rerun --create-flexrv-meta "
+                "--overwrite-meta" if os.path.basename(one) == META_FILE else
+                "rerun the load (or the group-Cauchy backfill) of this phenotype"))
+        return c
+    return None
+
+
+def _cauchy_t(p):
+    """Per-test Cauchy contribution tan((0.5-p)pi), with the 1/(p pi) small-p limit (as in the pipeline)."""
+    p = np.clip(np.asarray(p, dtype=float), 1e-300, 1 - 1e-15)
+    small = p < 1e-16
+    return np.where(small, 1 / (np.where(small, p, 1) * np.pi), np.tan((0.5 - p) * np.pi))
+
+
+def _cauchy_p(T):
+    """Equal-weight CCT p from the mean Cauchy statistic."""
+    T = np.asarray(T, dtype=float)
+    return np.where(T > 1e15, 1 / (np.where(T > 1e15, T, 1) * np.pi), stats.cauchy.sf(T))
+
+
+def read_weight_sets(directory: str) -> Optional[pd.DataFrame]:
+    """Per-weight-set burden tests of one phenotype (flexRV_native `gene_results_<max_MAF>.txt.bgz`
+    exports in its ht_results directory); None if the directory has none."""
+    try:
+        if directory.startswith("gs://"):
+            names = [os.path.basename(e.path.rstrip("/")) for e in _fs().ls(directory)]
+        else:
+            names = os.listdir(directory)
+    except FileNotFoundError:
+        return None
+    want = {"gene_id", "gene_symbol", "Run_group", "Weight", "max_MAF", "Pvalue_Burden", "Pvalue_Burden_log10",
+            "BETA_Burden", "SE_Burden", "nEff_Burden", "MAC"}
+    kw = dict(sep="\t", usecols=lambda c: c in want, compression="gzip", na_values=["NA"],
+              dtype={"Run_group": "category", "Weight": "category"})
+    parts = []
+    for n in sorted(n for n in names if TIER_FILE.fullmatch(n)):
+        if directory.startswith("gs://"):
+            with _fs().open(f"{directory}/{n}", "rb") as f:
+                parts.append(pd.read_csv(f, **kw))
+        else:
+            parts.append(pd.read_csv(os.path.join(directory, n), **kw))
+    if not parts or not {"Run_group", "nEff_Burden"} <= set(parts[0].columns):
+        return None
+    d = pd.concat(parts, ignore_index=True)
+    for c in ("Run_group", "Weight"):
+        d[c] = d[c].astype(str)
+    return d
+
+
+def production_meta_cct(path: str, nrows: int = None) -> Optional[pd.DataFrame]:
+    """Per-group table from the production run's cross-ancestry meta-analysis export; None if the file
+    is absent or is not that export (no META_Stats_Burden column).
+
+    One burden test per mask and max MAF tier: p = Pvalue_Burden, direction = sign of META_Stats_Burden
+    (BETA_top holds that Z, SE_top is 1), MAC = alleles summed over the ancestries. As in the per-ancestry
+    production tables, a tier with the same MAC as a lower tier of the same mask is the same variant set
+    and enters the CCT once.
+    """
+    want = {"gene_id", "gene_symbol", "annotation", "max_MAF", "MAC", "META_Stats_Burden", "Pvalue_Burden",
+            "Pvalue_Burden_log10"}
+    kw = dict(sep="\t", usecols=lambda c: c in want, compression="gzip", na_values=["NA"], nrows=nrows)
     try:
         if path.startswith("gs://"):
             with _fs().open(path, "rb") as f:
-                c = pd.read_csv(f, compression="gzip", **kw)
+                d = pd.read_csv(f, **kw)
         else:
-            c = pd.read_csv(path, **kw)
+            d = pd.read_csv(path, **kw)
     except FileNotFoundError:
         return None
-    return c
+    if "META_Stats_Burden" not in d.columns:
+        return None
+    d = d[(d.annotation != "Cauchy") & (d.max_MAF > 0) & d.META_Stats_Burden.notna()]
+    d = d.sort_values("max_MAF", kind="stable").drop_duplicates(["gene_id", "annotation", "MAC"])
+    d = d.rename(columns={"annotation": "Run_group", "META_Stats_Burden": "BETA_Burden"}).assign(
+        Weight="Beta_1_25", SE_Burden=1.0, nEff_Burden=np.nan)
+    return neff_floor_cct(d, 0)[0]
+
+
+def neff_floor_cct(d: pd.DataFrame, min_neff: float) -> (pd.DataFrame, dict):
+    """Per-group table (columns of the pipeline's gene_results_cauchy_by_group.tsv.gz that the report
+    reads) from read_weight_sets() rows, over the weight sets with nEff_Burden >= min_neff.
+
+    Tests without nEff_Burden are kept. A gene tested in two overlapping interval chunks has two copies
+    of each test; the copy with the most alleles is used (the pipeline keeps the chunk with the most).
+    Returns the table and the counts of tests read / dropped.
+    """
+    p = d.Pvalue_Burden.to_numpy(dtype=float)
+    if "Pvalue_Burden_log10" in d.columns:                     # p below the float range of the export
+        under = (p == 0) & d.Pvalue_Burden_log10.notna().to_numpy()
+        p = np.where(under, np.power(10.0, -d.Pvalue_Burden_log10.to_numpy(dtype=float)), p)
+    d = d.assign(p=p)
+    d = d[d.p.notna()]
+    key = ["gene_id", "Run_group", "Weight", "max_MAF"]
+    if d.duplicated(key).any():
+        d = d.sort_values("MAC", ascending=False, kind="stable").drop_duplicates(key)
+    sparse = (d.nEff_Burden < min_neff).to_numpy()
+    counts = dict(tests=len(d), dropped=int(sparse.sum()),
+                  groups=d.groupby(["gene_id", "Run_group"], observed=True).ngroups)
+    d = d[~sparse]
+    p, sg = d.p.to_numpy(), np.sign(d.BETA_Burden.to_numpy(dtype=float))
+    nom = p < SIGN_P
+    t = pd.DataFrame({
+        "gene_id": d.gene_id.to_numpy(), "Group": d.Run_group.to_numpy(), "p": p, "MAC": d.MAC.to_numpy(),
+        "_t": _cauchy_t(p), "_pos": sg > 0, "_neg": sg < 0, "_pos_nom": (sg > 0) & nom, "_neg_nom": (sg < 0) & nom,
+        "_t_pos": _cauchy_t(np.where(sg > 0, p / 2, 1 - p / 2)),
+        "_t_neg": _cauchy_t(np.where(sg < 0, p / 2, 1 - p / 2)),
+    }, index=d.index)
+    g = t.groupby(["gene_id", "Group"])
+    out = g.agg(n_tests=("_t", "size"), MAC=("MAC", "max"), cct=("_t", "mean"),
+                n_pos=("_pos", "sum"), n_neg=("_neg", "sum"), n_pos_nom=("_pos_nom", "sum"),
+                n_neg_nom=("_neg_nom", "sum"), t_pos=("_t_pos", "mean"), t_neg=("_t_neg", "mean"))
+    out["Pvalue_cct"] = _cauchy_p(out.cct)
+    out["Pvalue_cct_pos"] = _cauchy_p(out.t_pos)
+    out["Pvalue_cct_neg"] = _cauchy_p(out.t_neg)
+    top = d.loc[g.p.idxmin()]
+    top = top.set_index([top.gene_id, top.Run_group.rename("Group")])
+    out["BETA_top"], out["SE_top"], out["max_MAF_top"] = top.BETA_Burden, top.SE_Burden, top.max_MAF
+    out = out.drop(columns=["cct", "t_pos", "t_neg"]).reset_index()
+    counts["groups_lost"] = counts["groups"] - len(out)
+    sym = d.drop_duplicates("gene_id").set_index("gene_id").gene_symbol
+    out.insert(1, "gene_symbol", out.gene_id.map(sym))
+    return out, counts
 
 
 def cct_meta(c: pd.DataFrame) -> dict:
@@ -156,6 +330,8 @@ def gene_table(c: pd.DataFrame, pheno: str, plof_min_mac: float = PLOF_MIN_MAC) 
         "BETA_top_comb": v("BETA_top_comb"), "SE_top_comb": v("SE_top_comb"),
         "max_MAF_top_comb": v("max_MAF_top_comb"),
     })
+    # Z of the most significant combined test: BETA / SE per ancestry, the Stouffer Z in a meta-analysis
+    out["Z_top_comb"] = v("Z_top_comb") if "Z_top_comb" in w.columns else out.BETA_top_comb / out.SE_top_comb
     out["p_plof_dir"] = np.select([out.s_mis == 1, out.s_mis == -1],
                                   [w.Pvalue_cct_pos_plof.values, w.Pvalue_cct_neg_plof.values], np.nan)
     out["p_plof_cct_all"] = out.p_plof_cct
@@ -165,13 +341,38 @@ def gene_table(c: pd.DataFrame, pheno: str, plof_min_mac: float = PLOF_MIN_MAC) 
     return out
 
 
-def cct_loader(root: str, plof_min_mac: float = PLOF_MIN_MAC) -> Callable[[str], Optional[pd.DataFrame]]:
-    """pheno -> gene_table, reading `root`. load.meta(pheno) reads only the pipeline-written metadata."""
+def cct_loader(root: str, plof_min_mac: float = PLOF_MIN_MAC,
+               min_neff: float = MIN_NEFF) -> Callable[[str], Optional[pd.DataFrame]]:
+    """pheno -> gene_table, reading `root`. load.meta(pheno) reads only the pipeline-written metadata.
+
+    min_neff > 0: per-ancestry tables are rebuilt from the per-weight-set exports with the nEff_Burden
+    floor (neff_floor_cct). load.neff counts what the floor did; load.neff["unfiltered"] lists the
+    phenotypes without per-weight-set exports, used as written. Meta-analysis tables are used as written.
+    """
     files = list_cct_files(root)
+    neff = dict(min_neff=min_neff, phenotypes=0, tests=0, dropped=0, groups=0, groups_lost=0, unfiltered=[],
+                meta=0, production_meta=0)
 
     def load(pheno):
         c = read_cct(files[pheno]) if pheno in files else None
-        return None if c is None else gene_table(c, pheno, plof_min_mac)
+        if c is None:
+            return None
+        if c.attrs.get("is_meta"):
+            neff["production_meta" if c.attrs["is_meta"] == "production" else "meta"] += 1
+        elif min_neff > 0:
+            sets = read_weight_sets(c.attrs["directory"]) if c.attrs.get("directory") else None
+            if sets is None:
+                neff["unfiltered"].append(pheno)
+            else:
+                f, n = neff_floor_cct(sets, min_neff)
+                for k in META_COLS + ["phenoname"]:
+                    if k in c.columns and len(c):
+                        f[k] = c[k].iloc[0]
+                c = f
+                neff["phenotypes"] += 1
+                for k in ("tests", "dropped", "groups", "groups_lost"):
+                    neff[k] += n[k]
+        return gene_table(c, pheno, plof_min_mac)
 
     def meta(pheno):
         c = read_cct(files[pheno], nrows=1) if pheno in files else None
@@ -179,6 +380,7 @@ def cct_loader(root: str, plof_min_mac: float = PLOF_MIN_MAC) -> Callable[[str],
 
     load.phenotypes = list(files)
     load.meta = meta
+    load.neff = neff
     return load
 
 
@@ -627,7 +829,8 @@ def report(col: Collected, thr: dict, meta: pd.DataFrame, out: str, alpha: float
         else H.assign(attr=np.nan, p_attr=np.nan)
     Hx["attr"] = Hx.attr.fillna("not_in_attribution_set")
     Hx[["pheno", "kind", "gene", "gene_id", "symbol", "evidence", "novelty", "attr", "p_attr", "p_comb_cct",
-        "p_plof_cct", "p_mis_cct", "s_mis", "p_plof_dir", "BETA_top_comb", "SE_top_comb", "max_MAF_top_comb",
+        "p_plof_cct", "p_mis_cct", "s_mis", "p_plof_dir", "BETA_top_comb", "SE_top_comb", "Z_top_comb",
+        "max_MAF_top_comb",
         "PROD_plof", "PROD_mis", "PROD_plof_mis"]].sort_values("p_comb_cct") \
         .to_csv(os.path.join(out, "h_hits_weighted.tsv"), sep="\t", index=False)
 
@@ -787,7 +990,7 @@ def make_figures(out: str, alpha: float = ALPHA):
         ax.set_ylim(0, CAPY + 0.5)
         ax.set_xlabel("Missense CCT, −log10 p (selection; capped at 30)")
         ax.set_ylabel("Directional pLoF p, −log10 (capped at 12)")
-        has_prod = (Aw.novelty != "NA").any()
+        has_prod = (Aw.novelty.notna() & (Aw.novelty != "NA")).any()      # "NA" is read back as missing
         sub = (f"{n_test} tested gene × trait pairs with missense CCT < α; squares binary (empirical p)\n"
                + ("labels = LoF-like calls not significant in any production test" if has_prod else ""))
         ax.set_title("Attribution: does pLoF agree in the missense direction?", pad=8 + 11 * (sub.count("\n") + 1))
@@ -851,6 +1054,10 @@ def main(argv=None):
     ap.add_argument("--plof-min-mac", type=float, default=PLOF_MIN_MAC,
                     help="pLoF tests with fewer minor alleles are treated as not run (class pLoF_MAC_lt5); "
                          "applied to both runs, real and null phenotypes. 0 keeps every test")
+    ap.add_argument("--min-neff", type=float, default=MIN_NEFF,
+                    help="FlexRV weight sets with nEff_Burden below this are dropped and the per-group CCTs "
+                         "recomputed from the per-weight-set exports (gene_results_<max_MAF>.txt.bgz); applied "
+                         "to both runs where those exports exist. 0 uses the per-group tables as written")
     ap.add_argument("--skip-figures", action="store_true", help="tables only")
     ap.add_argument("--figures-only", action="store_true", help="redraw the figures from an existing --out")
     args = ap.parse_args(argv)
@@ -860,13 +1067,31 @@ def main(argv=None):
             ap.error("--weighted-root is required (unless --figures-only)")
         os.makedirs(args.out, exist_ok=True)
         say = Log(os.path.join(args.out, "report_log.txt"))
-        loaders = {"weighted": cct_loader(args.weighted_root, args.plof_min_mac)}
+        loaders = {"weighted": cct_loader(args.weighted_root, args.plof_min_mac, args.min_neff)}
         if args.production_root:
-            loaders["production"] = cct_loader(args.production_root, args.plof_min_mac)
+            loaders["production"] = cct_loader(args.production_root, args.plof_min_mac, args.min_neff)
         meta = build_meta(args, loaders)
         say(f"weighted: {args.weighted_root}\nproduction: {args.production_root or '-'}")
         say(f"pLoF tests with MAC < {args.plof_min_mac:g} are treated as not run (--plof-min-mac)")
+        say(f"FlexRV weight sets with nEff_Burden < {args.min_neff:g} are dropped (--min-neff)" if args.min_neff > 0
+            else "no nEff_Burden floor (--min-neff 0): per-group tables used as written")
         col, thr = collect(loaders, meta, args.alpha, args.keep_p, args.check_n, log=say)
+        for m, f in loaders.items():
+            n = f.neff
+            if n["phenotypes"]:
+                say(f"{m}: nEff floor applied to {n['phenotypes']} phenotypes: {n['dropped']:,} of {n['tests']:,} "
+                    f"weight-set tests dropped ({n['dropped'] / max(n['tests'], 1):.1%}); {n['groups_lost']:,} of "
+                    f"{n['groups']:,} gene x group left with no test")
+            if n["meta"]:
+                say(f"{m}: {n['meta']} meta-analysis tables used as written (nEff floor applied per ancestry "
+                    f"by --create-flexrv-meta; see their min_nEff column)")
+            if n["production_meta"]:
+                say(f"{m}: {n['production_meta']} production meta-analysis tables (Beta(1,25) burden per mask and "
+                    f"max MAF tier, no weight sets: the nEff floor does not apply)")
+            if args.min_neff > 0 and n["unfiltered"]:
+                u = sorted(set(n["unfiltered"]))
+                say(f"{m}: NO nEff floor for {len(u)} phenotypes (no per-weight-set exports next to the "
+                    f"per-group table): {', '.join(u[:20])}" + (" ..." if len(u) > 20 else ""))
         report(col, thr, meta, args.out, args.alpha, say)
     if not args.skip_figures:
         make_figures(args.out, args.alpha)

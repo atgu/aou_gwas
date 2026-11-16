@@ -673,6 +673,8 @@ def flexrv_native_group_cauchy_table(rows: pd.DataFrame) -> pd.DataFrame:
 FLEXRV_META_FILE = 'gene_results_flexrv_meta.tsv.gz'
 FLEXRV_META_PER_SET_FILE = 'gene_results_flexrv_meta_per_set.tsv.gz'
 FLEXRV_META_MIN_NEFF = 10.0
+FLEXRV_META_PLOF_GROUP = 'pLoF'
+FLEXRV_META_PLOF_MIN_MAC = 5.0
 
 
 def flexrv_meta_tests(rows: pd.DataFrame, n_cases: float, n_controls: float = None,
@@ -730,21 +732,68 @@ def flexrv_meta_table(tests_by_ancestry: dict) -> tuple:
     per_set['Pvalue_meta'] = 2 * norm.sf(per_set.Z_meta.abs())
     per_set = per_set.drop(columns=['_wz', '_w2'])
 
-    per_set['_t'] = _cauchy_t(per_set.Pvalue_meta)
-    g = per_set.groupby(['Region', 'Run_group'])
-    out = g.agg(cct_stat=('_t', 'mean'), n_sets=('_t', 'size'), MAC=('MAC', 'max'))
-    out['Pvalue_meta_cct'] = _cauchy_p(out.cct_stat)
-    out['n_ancestries'] = d.groupby(['Region', 'Run_group']).ancestry.nunique()
-    top = per_set.loc[g.Pvalue_meta.idxmin()].set_index(['Region', 'Run_group'])
-    out['Weight_top'], out['Z_top'], out['Pvalue_top'] = top.Weight, top.Z_meta, top.Pvalue_meta
-    out['ancestries_top'] = top.ancestries
-    out = out.drop(columns='cct_stat').reset_index().rename(columns={'Run_group': 'Group'})
-    per_set = per_set.drop(columns='_t').rename(columns={'Run_group': 'Group'})
+    out = flexrv_meta_summary(per_set, ['Region', 'Run_group'])
+    out.insert(out.columns.get_loc('Pvalue_meta_cct') + 1, 'n_ancestries',
+               d.groupby(['Region', 'Run_group']).ancestry.nunique())
+    out = out.reset_index().rename(columns={'Run_group': 'Group'})
+    per_set = per_set.rename(columns={'Run_group': 'Group'})
     return _split_region(out), _split_region(per_set)
 
 
+def flexrv_meta_summary(per_set: pd.DataFrame, keys: list) -> pd.DataFrame:
+    """Per `keys` (gene, group): the CCT over the weight sets of the per-weight-set Stouffer results.
+
+    per_set: one row per (gene, group, weight set) with MAC, Z_meta, Pvalue_meta, Weight, ancestries.
+    Besides Pvalue_meta_cct and the most significant weight set (*_top), writes the direction
+    summaries utils/discovery.py reads, defined as in the per-ancestry per-group table but on the
+    meta-analysed weight sets: n_pos / n_neg (sign of Z_meta), the same among sets with
+    Pvalue_meta < SIGN_P (*_nom), and Pvalue_meta_cct_pos / _neg, the CCT of the one-sided p.
+    """
+    p = per_set.Pvalue_meta.to_numpy()
+    sg = np.sign(per_set.Z_meta.to_numpy())
+    nom = p < SIGN_P
+    t = pd.DataFrame({
+        '_t': _cauchy_t(p),
+        '_pos': sg > 0, '_neg': sg < 0, '_pos_nom': (sg > 0) & nom, '_neg_nom': (sg < 0) & nom,
+        '_t_pos': _cauchy_t(np.where(sg > 0, p / 2, 1 - p / 2)),
+        '_t_neg': _cauchy_t(np.where(sg < 0, p / 2, 1 - p / 2)),
+        'MAC': per_set.MAC.to_numpy(), 'Pvalue_meta': p,
+    }, index=per_set.index)
+    g = t.groupby([per_set[k] for k in keys])
+    out = g.agg(n_sets=('_t', 'size'), MAC=('MAC', 'max'), cct_stat=('_t', 'mean'),
+                n_pos=('_pos', 'sum'), n_neg=('_neg', 'sum'),
+                n_pos_nom=('_pos_nom', 'sum'), n_neg_nom=('_neg_nom', 'sum'),
+                t_pos=('_t_pos', 'mean'), t_neg=('_t_neg', 'mean'))
+    out.insert(2, 'Pvalue_meta_cct', _cauchy_p(out.cct_stat))
+    out['Pvalue_meta_cct_pos'] = _cauchy_p(out.t_pos)
+    out['Pvalue_meta_cct_neg'] = _cauchy_p(out.t_neg)
+    top = per_set.loc[g.Pvalue_meta.idxmin()].set_index(keys)
+    out['Weight_top'], out['Z_top'], out['Pvalue_top'] = top.Weight, top.Z_meta, top.Pvalue_meta
+    out['ancestries_top'] = top.ancestries
+    return out.drop(columns=['cct_stat', 't_pos', 't_neg'])
+
+
+def flexrv_meta_plof_floor(res: pd.DataFrame, min_mac: float = FLEXRV_META_PLOF_MIN_MAC) -> pd.DataFrame:
+    """Blank the meta p-values of pLoF tests on fewer than `min_mac` minor alleles pooled over ancestries.
+
+    The pLoF group is one Beta(1,25) burden test without nEff_Burden, so the nEff floor never reaches
+    it, and on a real quantitative trait a test on one to four alleles can pass the exome-wide
+    threshold on a single outlying carrier. Such rows keep their MAC and *_top columns; Pvalue_meta_cct
+    and its one-sided versions are set to missing. Pvalue_meta_cct_unfiltered (added for every row)
+    holds Pvalue_meta_cct as it was before this rule. min_mac = 0 keeps all.
+    """
+    res = res.copy()
+    res.insert(res.columns.get_loc('Pvalue_meta_cct') + 1, 'Pvalue_meta_cct_unfiltered', res.Pvalue_meta_cct)
+    low = ((res.Group == FLEXRV_META_PLOF_GROUP) & (res.MAC < min_mac)).to_numpy()
+    res.loc[low, ['Pvalue_meta_cct', 'Pvalue_meta_cct_pos', 'Pvalue_meta_cct_neg']] = np.nan
+    print(f'  {int(low.sum())} of {int((res.Group == FLEXRV_META_PLOF_GROUP).sum())} pLoF tests blanked at '
+          f'pooled MAC < {min_mac:g}')
+    return res
+
+
 def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_directory: str, phenoname: str,
-                       min_neff: float = FLEXRV_META_MIN_NEFF, write_per_set: bool = False):
+                       min_neff: float = FLEXRV_META_MIN_NEFF, write_per_set: bool = False,
+                       plof_min_mac: float = FLEXRV_META_PLOF_MIN_MAC):
     """Write the cross-ancestry FlexRV table of one phenotype (and, with write_per_set, the
     Stouffer result of every weight set: a large diagnostic file).
 
@@ -752,10 +801,12 @@ def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_direc
     group_cauchy_paths: ancestry -> its gene_results_cauchy_by_group.tsv.gz, read for the case and
     control counts and for the per-ancestry Pvalue_cct columns. An ancestry without results is
     skipped; one with results but no per-group table is an error (load its results first).
+    pLoF tests below plof_min_mac pooled alleles get a missing p (flexrv_meta_plof_floor); the
+    per-weight-set file is not filtered.
     """
     import gzip
 
-    tests, per_ancestry_p, sizes = {}, {}, {}
+    tests, per_ancestry_p, sizes, trait_types = {}, {}, {}, set()
     for ancestry, directory in directories.items():
         paths = [m.path for m in hfs.ls(f'{directory}/*.gene.txt')] if hfs.exists(directory) else []
         if not paths:
@@ -778,6 +829,7 @@ def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_direc
         print(f'[{ancestry.upper()}: {phenoname}] n_cases={n_cases}, n_controls={n_controls}')
         tests[ancestry] = flexrv_meta_tests(rows, n_cases, n_controls, min_neff)
         sizes[ancestry.upper()] = (n_cases, n_controls)
+        trait_types.add(cct.trait_type.iloc[0])
         per_ancestry_p[ancestry.upper()] = cct.set_index(['gene_id', 'Group']).Pvalue_cct
     if not tests:
         raise ValueError(f'[{phenoname}] no flexRV_native results in any of {sorted(directories)}')
@@ -785,13 +837,23 @@ def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_direc
         print(f'[{phenoname}] WARNING: one ancestry only ({next(iter(tests)).upper()}); the meta-analysis is that ancestry')
 
     res, per_set = flexrv_meta_table(tests)
+    res = flexrv_meta_plof_floor(res, plof_min_mac)
     index = pd.MultiIndex.from_frame(res[['gene_id', 'Group']])
     for ancestry, p in per_ancestry_p.items():
         res[f'Pvalue_cct_{ancestry}'] = p.reindex(index).to_numpy()
     for table in (res, per_set):
         table.insert(0, 'phenoname', phenoname)
-    res.insert(1, 'min_nEff', min_neff)
-    res.insert(2, 'ancestries_run', ','.join(sorted(sizes)))
+    if len(trait_types) > 1:
+        raise ValueError(f'[{phenoname}] trait_type differs between ancestries: {sorted(map(str, trait_types))}')
+    # trait type and total sample sizes over the ancestries run, for utils/discovery.py (as in the
+    # per-ancestry table: n_controls is NA for a quantitative trait)
+    trait_type = next(iter(trait_types))
+    res.insert(1, 'trait_type', trait_type)
+    res.insert(2, 'n_cases', sum(n for n, _ in sizes.values()))
+    res.insert(3, 'n_controls', sum(c for _, c in sizes.values()) if trait_type == 'binary' else np.nan)
+    res.insert(4, 'min_nEff', min_neff)
+    res.insert(5, 'min_MAC_pLoF', plof_min_mac)
+    res.insert(6, 'ancestries_run', ','.join(sorted(sizes)))
     outputs = [(res, FLEXRV_META_FILE)] + ([(per_set, FLEXRV_META_PER_SET_FILE)] if write_per_set else [])
     for table, name in outputs:
         with hfs.open(f'{output_directory}/{name}', 'wb') as f:
@@ -2982,7 +3044,8 @@ def main(args):
         subdir = f"{args.saige_gene_map_source}/{resolve_mode_subdir(args.saige_gene_mode, args.saige_gene_weight)}"
         result_root = f'{RESULTS_PATH}/gene_results{"" if not args.misc_test else "_misc"}/result/{subdir}'
         ht_root = f'{RESULTS_PATH}/ht_results/{subdir}'
-        print(f'FlexRV meta-analysis over {meta_ancestries}: {ht_root}/META (nEff_Burden >= {args.meta_min_neff:g})')
+        print(f'FlexRV meta-analysis over {meta_ancestries}: {ht_root}/META (nEff_Burden >= {args.meta_min_neff:g}, '
+              f'pLoF pooled MAC >= {args.meta_plof_min_mac:g})')
         if not args.dataproc:
             b = hb.Batch(
                 name=f"aou_flexrv_meta_{args.saige_gene_weight.upper()}",
@@ -3002,6 +3065,7 @@ def main(args):
                 phenoname=pheno,
                 min_neff=args.meta_min_neff,
                 write_per_set=args.meta_per_set,
+                plof_min_mac=args.meta_plof_min_mac,
             )
             if args.dataproc:
                 export_flexrv_meta(**kwargs)
@@ -3522,6 +3586,13 @@ if __name__ == "__main__":
         help="--create-flexrv-meta: drop a weight set of an ancestry whose nEff_Burden (Kish's effective "
              "carrier count) is below this; 0 keeps all",
         default=FLEXRV_META_MIN_NEFF,
+        type=float,
+    )
+    parser.add_argument(
+        "--meta-plof-min-mac",
+        help="--create-flexrv-meta: a pLoF test on fewer minor alleles than this, pooled over the ancestries, "
+             "gets a missing Pvalue_meta_cct (the value stays in Pvalue_meta_cct_unfiltered); 0 keeps all",
+        default=FLEXRV_META_PLOF_MIN_MAC,
         type=float,
     )
     parser.add_argument(
