@@ -744,8 +744,9 @@ def flexrv_meta_table(tests_by_ancestry: dict) -> tuple:
 
 
 def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_directory: str, phenoname: str,
-                       min_neff: float = FLEXRV_META_MIN_NEFF):
-    """Write the cross-ancestry FlexRV tables of one phenotype.
+                       min_neff: float = FLEXRV_META_MIN_NEFF, write_per_set: bool = False):
+    """Write the cross-ancestry FlexRV table of one phenotype (and, with write_per_set, the
+    Stouffer result of every weight set: a large diagnostic file).
 
     directories: ancestry -> directory of that ancestry's flexRV_native *.gene.txt;
     group_cauchy_paths: ancestry -> its gene_results_cauchy_by_group.tsv.gz, read for the case and
@@ -791,7 +792,8 @@ def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_direc
         table.insert(0, 'phenoname', phenoname)
     res.insert(1, 'min_nEff', min_neff)
     res.insert(2, 'ancestries_run', ','.join(sorted(sizes)))
-    for table, name in ((res, FLEXRV_META_FILE), (per_set, FLEXRV_META_PER_SET_FILE)):
+    outputs = [(res, FLEXRV_META_FILE)] + ([(per_set, FLEXRV_META_PER_SET_FILE)] if write_per_set else [])
+    for table, name in outputs:
         with hfs.open(f'{output_directory}/{name}', 'wb') as f:
             f.write(gzip.compress(table.to_csv(sep='\t', index=False, na_rep='NA').encode()))
     print(f'FlexRV meta-analysis: {len(res)} gene x group rows, {len(per_set)} weight-set rows -> {output_directory}')
@@ -983,15 +985,12 @@ def load_gene_data(directory: str,
                             n_cases=n_cases, n_controls=n_controls)
 
     if flexrv_native:
-        max_maf_tiers, has_cauchy = ht.aggregate((
-            hl.agg.filter(hl.is_defined(ht.max_MAF), hl.agg.collect_as_set(ht.max_MAF)),
-            hl.agg.any(hl.is_missing(ht.max_MAF)),
-        ))
-        print(f'max_MAF tiers found: {sorted(max_maf_tiers)}; Cauchy rows: {has_cauchy}')
+        # The Cauchy rows (missing max_MAF) get no text export of their own: they are in the
+        # expected-p exports below and in the per-group table.
+        max_maf_tiers = ht.aggregate(hl.agg.filter(hl.is_defined(ht.max_MAF), hl.agg.collect_as_set(ht.max_MAF)))
+        print(f'max_MAF tiers found: {sorted(max_maf_tiers)}')
         for max_MAF in sorted(max_maf_tiers, reverse=True):
             ht.filter(ht.max_MAF == max_MAF).export(output_ht_path.replace('.ht', f'_{max_MAF}.txt.bgz'))
-        if has_cauchy:
-            ht.filter(hl.is_missing(ht.max_MAF)).export(output_ht_path.replace('.ht', '_cauchy.txt.bgz'))
     if flexrv_native or not phenoname.endswith('male') or phenoname.startswith('EM_202.2') or phenoname.startswith('EM_236.1') or phenoname.startswith('A10BJ'):
         method = 'exact'
         success = output_ht_path.replace('.ht', f'_{method}_expected_p.ht/_SUCCESS')
@@ -3002,6 +3001,7 @@ def main(args):
                 output_directory=output_directory,
                 phenoname=pheno,
                 min_neff=args.meta_min_neff,
+                write_per_set=args.meta_per_set,
             )
             if args.dataproc:
                 export_flexrv_meta(**kwargs)
@@ -3523,6 +3523,12 @@ if __name__ == "__main__":
              "carrier count) is below this; 0 keeps all",
         default=FLEXRV_META_MIN_NEFF,
         type=float,
+    )
+    parser.add_argument(
+        "--meta-per-set",
+        help="--create-flexrv-meta: also write gene_results_flexrv_meta_per_set.tsv.gz, the Stouffer Z and p "
+             "of every weight set (diagnostic; about 40 times the size of the main table)",
+        action="store_true",
     )
     parser.add_argument(
         "--overwrite-meta", help="Overwrite meta HT / the FlexRV meta tables", action="store_true"
