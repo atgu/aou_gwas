@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 import numpy as np
 import pandas as pd
-from scipy.stats import cauchy
+from scipy.stats import cauchy, norm
 import pickle
 import argparse
 import logging
@@ -620,7 +620,7 @@ def group_cauchy_table(tests: pd.DataFrame, drop_duplicate_tiers: bool = True) -
 def read_flexrv_native_gene_txt(paths, p_field: str = 'Pvalue_Burden') -> pd.DataFrame:
     """All rows (per weight set and Cauchy) of flexRV_native *.gene.txt files, tagged with their chunk."""
     cols = ['Region', 'Group', 'Run_group', 'Weight', 'max_MAF', p_field, 'BETA_Burden', 'SE_Burden',
-            'MAC', 'Number_rare']
+            'nEff_Burden', 'MAC', 'Number_rare']
 
     def _read(path):
         with hfs.open(path) as f:
@@ -634,6 +634,12 @@ def read_flexrv_native_gene_txt(paths, p_field: str = 'Pvalue_Burden') -> pd.Dat
     return d[d.p.notna()].drop(columns=p_field)
 
 
+def _best_chunk(d: pd.DataFrame) -> pd.DataFrame:
+    """(Region, chunk) of the chunk carrying the most alleles of each gene (genes split across overlapping intervals)."""
+    return (d.groupby(['Region', 'chunk']).MAC.max().reset_index()
+              .sort_values('MAC', ascending=False).drop_duplicates('Region'))[['Region', 'chunk']]
+
+
 def flexrv_native_group_cauchy_table(rows: pd.DataFrame) -> pd.DataFrame:
     """One row per (gene, --groups entry) from read_flexrv_native_gene_txt() rows.
 
@@ -642,9 +648,7 @@ def flexrv_native_group_cauchy_table(rows: pd.DataFrame) -> pd.DataFrame:
     """
     is_cauchy = (rows.Group == 'Cauchy').to_numpy()
     d = rows[~is_cauchy].copy()
-    # a gene split across overlapping intervals: keep the chunk carrying the most alleles
-    best = (d.groupby(['Region', 'chunk']).MAC.max().reset_index()
-              .sort_values('MAC', ascending=False).drop_duplicates('Region'))[['Region', 'chunk']]
+    best = _best_chunk(d)
     d = d.merge(best, on=['Region', 'chunk'])
     slim = (rows[is_cauchy].merge(best, on=['Region', 'chunk'])
             .drop_duplicates(['Region', 'Run_group']).set_index(['Region', 'Run_group']).p)
@@ -661,6 +665,137 @@ def flexrv_native_group_cauchy_table(rows: pd.DataFrame) -> pd.DataFrame:
     out.insert(i, 'Pvalue_cct_recomputed', recomputed)
     out['Pvalue_cct'] = np.where(is_beta | np.isnan(slim_p), recomputed, slim_p)
     return _split_region(out.reset_index())
+
+
+# --------------------------------------------------------------------------------------------------
+# Cross-ancestry meta-analysis of flexRV_native results
+# --------------------------------------------------------------------------------------------------
+FLEXRV_META_FILE = 'gene_results_flexrv_meta.tsv.gz'
+FLEXRV_META_PER_SET_FILE = 'gene_results_flexrv_meta_per_set.tsv.gz'
+FLEXRV_META_MIN_NEFF = 10.0
+
+
+def flexrv_meta_tests(rows: pd.DataFrame, n_cases: float, n_controls: float = None,
+                      min_neff: float = FLEXRV_META_MIN_NEFF) -> pd.DataFrame:
+    """One ancestry's per-weight-set burden tests as signed Z and Stouffer weight.
+
+    rows: read_flexrv_native_gene_txt() output. Z = sign(BETA_Burden) * qnorm(1 - p/2); weight =
+    sqrt(Neff * 2 CAF (1 - CAF)) with Neff = 4 n_cases n_controls / (n_cases + n_controls) (N for a
+    quantitative trait: n_controls missing) and CAF = MAC / 2N. Tests with nEff_Burden < min_neff
+    (a weight set resting on a handful of carriers) are dropped; a test without nEff_Burden
+    (Beta(1,25) calls do not write it) is kept.
+    """
+    d = rows[rows.Group != 'Cauchy']
+    d = d.merge(_best_chunk(d), on=['Region', 'chunk'])
+    has_controls = n_controls is not None and not pd.isna(n_controls) and n_controls > 0
+    n = n_cases + (n_controls if has_controls else 0)
+    n_eff_samples = 4.0 * n_cases * n_controls / n if has_controls else float(n)
+    caf = d.MAC.to_numpy(dtype=float) / (2.0 * n)
+    neff = (pd.to_numeric(d.nEff_Burden, errors='coerce') if 'nEff_Burden' in d.columns
+            else pd.Series(np.nan, index=d.index)).to_numpy()
+    out = pd.DataFrame({
+        'Region': d.Region.to_numpy(), 'Run_group': d.Run_group.to_numpy(), 'Weight': d.Weight.to_numpy(),
+        'MAC': d.MAC.to_numpy(),
+        'z': np.sign(d.BETA_Burden.to_numpy(dtype=float)) * norm.isf(np.clip(d.p.to_numpy(), 1e-300, 1) / 2),
+        'w': np.sqrt(n_eff_samples * 2 * caf * (1 - caf)),
+        'nEff_Burden': neff,
+    })
+    usable = out.z.notna() & (out.w > 0)
+    sparse = usable & (out.nEff_Burden < min_neff)
+    print(f'  {len(out)} tests, {int((~usable).sum())} without a signed Z or weight, '
+          f'{int(sparse.sum())} dropped at nEff_Burden < {min_neff:g}, '
+          f'{int((usable & out.nEff_Burden.isna()).sum())} kept without nEff_Burden')
+    return out[usable & ~sparse]
+
+
+def flexrv_meta_table(tests_by_ancestry: dict) -> tuple:
+    """Cross-ancestry FlexRV p per (gene, --groups entry) from flexrv_meta_tests() frames keyed by ancestry.
+
+    Each weight set is meta-analysed across the ancestries that tested it (signed Stouffer; the
+    ancestries are independent samples), then the weight sets, which are correlated tests of the
+    same data, are Cauchy-combined once. Returns (gene x group table, per-weight-set table).
+    """
+    names = sorted(a.upper() for a in tests_by_ancestry)
+    d = pd.concat([t.assign(ancestry=a.upper(), _bit=1 << names.index(a.upper()))
+                   for a, t in tests_by_ancestry.items()], ignore_index=True)
+    d['_wz'], d['_w2'] = d.w * d.z, d.w ** 2
+    keys = ['Region', 'Run_group', 'Weight']
+    per_set = d.groupby(keys, sort=False).agg(
+        _wz=('_wz', 'sum'), _w2=('_w2', 'sum'), MAC=('MAC', 'sum'), n_ancestries=('ancestry', 'size'),
+        _mask=('_bit', 'sum')).reset_index()
+    # one test per (gene, group, weight set, ancestry), so the bit sum is the set of ancestries
+    per_set['ancestries'] = per_set.pop('_mask').map(
+        {m: ','.join(n for i, n in enumerate(names) if m >> i & 1) for m in range(1 << len(names))})
+    per_set['Z_meta'] = per_set._wz / np.sqrt(per_set._w2)
+    per_set['Pvalue_meta'] = 2 * norm.sf(per_set.Z_meta.abs())
+    per_set = per_set.drop(columns=['_wz', '_w2'])
+
+    per_set['_t'] = _cauchy_t(per_set.Pvalue_meta)
+    g = per_set.groupby(['Region', 'Run_group'])
+    out = g.agg(cct_stat=('_t', 'mean'), n_sets=('_t', 'size'), MAC=('MAC', 'max'))
+    out['Pvalue_meta_cct'] = _cauchy_p(out.cct_stat)
+    out['n_ancestries'] = d.groupby(['Region', 'Run_group']).ancestry.nunique()
+    top = per_set.loc[g.Pvalue_meta.idxmin()].set_index(['Region', 'Run_group'])
+    out['Weight_top'], out['Z_top'], out['Pvalue_top'] = top.Weight, top.Z_meta, top.Pvalue_meta
+    out['ancestries_top'] = top.ancestries
+    out = out.drop(columns='cct_stat').reset_index().rename(columns={'Run_group': 'Group'})
+    per_set = per_set.drop(columns='_t').rename(columns={'Run_group': 'Group'})
+    return _split_region(out), _split_region(per_set)
+
+
+def export_flexrv_meta(directories: dict, group_cauchy_paths: dict, output_directory: str, phenoname: str,
+                       min_neff: float = FLEXRV_META_MIN_NEFF):
+    """Write the cross-ancestry FlexRV tables of one phenotype.
+
+    directories: ancestry -> directory of that ancestry's flexRV_native *.gene.txt;
+    group_cauchy_paths: ancestry -> its gene_results_cauchy_by_group.tsv.gz, read for the case and
+    control counts and for the per-ancestry Pvalue_cct columns. An ancestry without results is
+    skipped; one with results but no per-group table is an error (load its results first).
+    """
+    import gzip
+
+    tests, per_ancestry_p, sizes = {}, {}, {}
+    for ancestry, directory in directories.items():
+        paths = [m.path for m in hfs.ls(f'{directory}/*.gene.txt')] if hfs.exists(directory) else []
+        if not paths:
+            print(f'[{ancestry.upper()}: {phenoname}] no *.gene.txt under {directory}; ancestry skipped')
+            continue
+        if not hfs.exists(group_cauchy_paths[ancestry]):
+            raise ValueError(f'[{ancestry.upper()}: {phenoname}] {group_cauchy_paths[ancestry]} is missing: '
+                             f'load the results of this ancestry before the meta-analysis')
+        with hfs.open(group_cauchy_paths[ancestry], 'rb') as f:
+            cct = pd.read_csv(f, sep='\t', compression='gzip', na_values=['NA'])
+        n_cases, n_controls = cct.n_cases.iloc[0], cct.n_controls.iloc[0]
+        if pd.isna(n_cases) or (cct.trait_type.iloc[0] == 'binary' and not n_controls > 0):
+            # tables loaded before the saige-slim log parsing was fixed hold n_cases = N, n_controls = NA
+            raise ValueError(f'[{ancestry.upper()}: {phenoname}] {group_cauchy_paths[ancestry]} has n_cases={n_cases}, '
+                             f'n_controls={n_controls} for a {cct.trait_type.iloc[0]} trait: reload this '
+                             f'ancestry (--overwrite-hail-results) before the meta-analysis')
+        rows = read_flexrv_native_gene_txt(paths)
+        if 'Run_group' not in rows.columns:
+            raise ValueError(f'{directory} holds no flexRV_native results (no Run_group column)')
+        print(f'[{ancestry.upper()}: {phenoname}] n_cases={n_cases}, n_controls={n_controls}')
+        tests[ancestry] = flexrv_meta_tests(rows, n_cases, n_controls, min_neff)
+        sizes[ancestry.upper()] = (n_cases, n_controls)
+        per_ancestry_p[ancestry.upper()] = cct.set_index(['gene_id', 'Group']).Pvalue_cct
+    if not tests:
+        raise ValueError(f'[{phenoname}] no flexRV_native results in any of {sorted(directories)}')
+    if len(tests) == 1:
+        print(f'[{phenoname}] WARNING: one ancestry only ({next(iter(tests)).upper()}); the meta-analysis is that ancestry')
+
+    res, per_set = flexrv_meta_table(tests)
+    index = pd.MultiIndex.from_frame(res[['gene_id', 'Group']])
+    for ancestry, p in per_ancestry_p.items():
+        res[f'Pvalue_cct_{ancestry}'] = p.reindex(index).to_numpy()
+    for table in (res, per_set):
+        table.insert(0, 'phenoname', phenoname)
+    res.insert(1, 'min_nEff', min_neff)
+    res.insert(2, 'ancestries_run', ','.join(sorted(sizes)))
+    for table, name in ((res, FLEXRV_META_FILE), (per_set, FLEXRV_META_PER_SET_FILE)):
+        with hfs.open(f'{output_directory}/{name}', 'wb') as f:
+            f.write(gzip.compress(table.to_csv(sep='\t', index=False, na_rep='NA').encode()))
+    print(f'FlexRV meta-analysis: {len(res)} gene x group rows, {len(per_set)} weight-set rows -> {output_directory}')
+    return res
 
 
 def export_group_cauchy(directory: str, output_path: str, phenoname: str, trait_type: str = None,
@@ -2835,6 +2970,50 @@ def main(args):
             logger.info(f"Finished: {get_tasks_from_pipeline(b)}")
             b.run(delete_scratch_on_exit=False)
 
+    if args.create_flexrv_meta:
+        if args.saige_gene_mode != 'flexRV_native' or args.saige_gene_weight is None:
+            raise ValueError("--create-flexrv-meta needs --saige-gene-mode flexRV_native and --saige-gene-weight")
+        if args.pilot:
+            meta_phenos = list(PILOT_PHENOTYPES)
+        elif args.phenos is not None:
+            meta_phenos = args.phenos.split(',')
+        else:
+            raise ValueError("--create-flexrv-meta needs --phenos (or --pilot)")
+        meta_ancestries = [a for a in args.ancestries.split(',') if a.lower() != 'all']
+        subdir = f"{args.saige_gene_map_source}/{resolve_mode_subdir(args.saige_gene_mode, args.saige_gene_weight)}"
+        result_root = f'{RESULTS_PATH}/gene_results{"" if not args.misc_test else "_misc"}/result/{subdir}'
+        ht_root = f'{RESULTS_PATH}/ht_results/{subdir}'
+        print(f'FlexRV meta-analysis over {meta_ancestries}: {ht_root}/META (nEff_Burden >= {args.meta_min_neff:g})')
+        if not args.dataproc:
+            b = hb.Batch(
+                name=f"aou_flexrv_meta_{args.saige_gene_weight.upper()}",
+                backend=hb.ServiceBackend(billing_project="all-by-aou-fy27", remote_tmpdir=TMP_BUCKET),
+                default_regions=['us-central1'],
+            )
+        for pheno in meta_phenos:
+            output_directory = f'{ht_root}/META/phenotype_{pheno}'
+            if hfs.exists(f'{output_directory}/{FLEXRV_META_FILE}') and not args.overwrite_meta:
+                print(f'[META: {pheno}] exists, skipped (--overwrite-meta to redo)')
+                continue
+            kwargs = dict(
+                directories={a: f'{result_root}/{a.upper()}/phenotype_{pheno}' for a in meta_ancestries},
+                group_cauchy_paths={a: f'{ht_root}/{a.upper()}/phenotype_{pheno}/{GROUP_CAUCHY_FILE}'
+                                    for a in meta_ancestries},
+                output_directory=output_directory,
+                phenoname=pheno,
+                min_neff=args.meta_min_neff,
+            )
+            if args.dataproc:
+                export_flexrv_meta(**kwargs)
+            else:
+                j = b.new_python_job(name=f'flexrv_meta_{pheno}', attributes={"phenotype": pheno})
+                j.image("hailgenetics/hail:0.2.133-py3.11")
+                j.memory('highmem')
+                j.cpu(4)
+                j.call(export_flexrv_meta, **kwargs)
+        if not args.dataproc:
+            b.run(delete_scratch_on_exit=False)
+
     if args.create_meta_analysis_ht:
         # hl.stop()
         timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
@@ -3331,7 +3510,22 @@ if __name__ == "__main__":
         "--create-meta-analysis-ht", help="Create meta HT", action="store_true"
     )
     parser.add_argument(
-        "--overwrite-meta", help="Overwrite meta HT", action="store_true"
+        "--create-flexrv-meta",
+        help="Cross-ancestry meta-analysis of flexRV_native gene results (needs --saige-gene-mode "
+             "flexRV_native, --saige-gene-weight, --phenos or --pilot, and each ancestry's loaded results): "
+             "signed Stouffer per weight set across --ancestries, then one Cauchy over the weight sets. "
+             "Writes ht_results/<map source>/flexRV_native/<SCORE>/META/phenotype_<pheno>/",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--meta-min-neff",
+        help="--create-flexrv-meta: drop a weight set of an ancestry whose nEff_Burden (Kish's effective "
+             "carrier count) is below this; 0 keeps all",
+        default=FLEXRV_META_MIN_NEFF,
+        type=float,
+    )
+    parser.add_argument(
+        "--overwrite-meta", help="Overwrite meta HT / the FlexRV meta tables", action="store_true"
     )
     parser.add_argument(
         "--highmem", help="Use high memory", action="store_true"
